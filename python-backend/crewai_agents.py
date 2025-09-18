@@ -80,6 +80,30 @@ def search_web(query: str) -> str:
     return asyncio.run(_search())
 
 
+@tool
+def read_gmail_emails(user_id: str, max_results: int = 10, query: str = "") -> str:
+    """Read emails from Gmail inbox. Use this to check recent emails or search for specific messages."""
+    from langchain_tools import GmailReadTool
+    tool_instance = GmailReadTool()
+    return tool_instance._run(user_id, max_results, query)
+
+
+@tool  
+def send_gmail_email(user_id: str, to_email: str, subject: str, body: str) -> str:
+    """Send an email through Gmail. Use this to compose and send emails on behalf of the user."""
+    from langchain_tools import GmailSendTool
+    tool_instance = GmailSendTool()
+    return tool_instance._run(user_id, to_email, subject, body)
+
+
+@tool
+def search_gmail_emails(user_id: str, query: str, max_results: int = 20) -> str:
+    """Search Gmail emails with advanced queries. Supports Gmail search operators like from:, subject:, has:attachment, etc."""
+    from langchain_tools import GmailSearchTool
+    tool_instance = GmailSearchTool()
+    return tool_instance._run(user_id, query, max_results)
+
+
 def get_agents():
     """Get fresh agent instances with current LLM configuration."""
     llm = get_llm()
@@ -123,12 +147,27 @@ def get_agents():
         verbose=True,
         allow_delegation=False
     )
+
+    # Define the Gmail Agent
+    gmail_agent = Agent(
+        role="Gmail Assistant",
+        goal="""You are a specialized Gmail assistant who can read, search, and send emails.
+        Your role is to help users manage their Gmail efficiently and intelligently.""",
+        backstory="""You are an intelligent email assistant with deep understanding of email communication patterns.
+        You can read emails, understand context, compose professional responses, and help organize email workflows.
+        You're expert at email etiquette, can summarize conversations, and provide smart email management suggestions.
+        You always respect privacy and ask for confirmation before sending emails.""",
+        tools=[read_gmail_emails, send_gmail_email, search_gmail_emails],
+        llm=llm,
+        verbose=True,
+        allow_delegation=False
+    )
     
-    return research_agent, analysis_agent, writer_agent
+    return research_agent, analysis_agent, writer_agent, gmail_agent
 
 
 # Legacy agent definitions (kept for compatibility)
-research_agent, analysis_agent, writer_agent = get_agents()
+research_agent, analysis_agent, writer_agent, gmail_agent = get_agents()
 
 def create_research_task(user_query: str) -> Task:
     """Create a research task for the Research Agent."""
@@ -209,10 +248,55 @@ def create_crew(user_query: str) -> Crew:
     
     return crew
 
+
+def process_gmail_query(user_query: str, user_id: str):
+    """Process Gmail-related queries using specialized Gmail agent."""
+    llm = get_llm()
+    
+    # Get fresh agents
+    _, _, _, gmail_agent = get_agents()
+    
+    # Create Gmail-specific task
+    gmail_task = Task(
+        description=f"""
+        Handle the following Gmail-related request: "{user_query}"
+        User ID: {user_id}
+        
+        Your task is to:
+        1. Understand what the user wants to do with Gmail (read emails, send email, search, etc.)
+        2. Use the appropriate Gmail tools to fulfill the request
+        3. If sending emails, always ask for confirmation before sending
+        4. Provide clear, helpful responses about email operations
+        5. Respect user privacy and security
+        
+        For email reading: Summarize emails clearly and helpfully
+        For email sending: Compose professional, appropriate emails
+        For email searching: Use relevant search terms and present results clearly
+        """,
+        agent=gmail_agent,
+        expected_output="A helpful response about the Gmail operation with clear information about what was done"
+    )
+    
+    # Create Gmail crew
+    gmail_crew = Crew(
+        agents=[gmail_agent],
+        tasks=[gmail_task],
+        process=Process.sequential,
+        llm=llm,
+        verbose=True
+    )
+    
+    try:
+        result = gmail_crew.kickoff()
+        return str(result)
+    except Exception as e:
+        return f"Error processing Gmail query: {str(e)}"
+
+
 def process_user_query(user_query: str):
     """Process user query using CrewAI agents with Gemini LLM."""
     # Get fresh agents with current LLM configuration
-    research_agent, analysis_agent, writer_agent = get_agents()
+    research_agent, analysis_agent, writer_agent, _ = get_agents()  # Ignore gmail_agent
     llm = get_llm()
     
     # Create the research task
@@ -282,5 +366,5 @@ def process_user_query(user_query: str):
     except Exception as e:
         return f"Error processing query: {str(e)}"
 
-# Export the main function
-__all__ = ['process_user_query', 'research_agent', 'analysis_agent', 'writer_agent']
+# Export the main functions
+__all__ = ['process_user_query', 'process_gmail_query', 'research_agent', 'analysis_agent', 'writer_agent', 'gmail_agent']

@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Dict, Any
 import os
 import re
 from dotenv import load_dotenv
-from crewai_agents import process_user_query, get_llm
+from crewai_agents import process_user_query, get_llm, process_gmail_query
 from auth_service import auth_service
 import asyncio
 import logging
@@ -13,7 +14,8 @@ from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import json
-from datetime import datetime
+import httpx
+from datetime import datetime, timedelta, timezone
 import jwt
 
 # Load environment variables
@@ -108,6 +110,42 @@ def is_simple_message(message: str) -> bool:
     return False
 
 
+def is_gmail_query(message: str) -> bool:
+    """
+    Determine if a message is related to Gmail operations.
+    Returns True for email-related queries.
+    """
+    message = message.lower().strip()
+    
+    gmail_keywords = [
+        'email', 'emails', 'gmail', 'inbox', 'send email', 'read email',
+        'check email', 'summarize email', 'email summary', 'mail',
+        'message', 'messages', 'compose', 'reply', 'forward',
+        'unread', 'new emails', 'recent emails', 'last week',
+        'email from', 'search email', 'find email', 'delete email'
+    ]
+    
+    # Check for Gmail-related keywords
+    for keyword in gmail_keywords:
+        if keyword in message:
+            return True
+    
+    # Check for common email patterns
+    gmail_patterns = [
+        r'(check|read|show|get|list|find)\s+(my\s+)?(email|inbox|mail)',
+        r'(send|compose|write)\s+(an?\s+)?(email|message)',
+        r'(summarize|summary|review)\s+(email|mail)',
+        r'email.*from\s+(last\s+)?(week|month|day)',
+        r'(new|recent|unread)\s+(email|mail|message)'
+    ]
+    
+    for pattern in gmail_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    return False
+
+
 async def simple_ai_response(message: str) -> str:
     """Generate a simple AI response without using CrewAI agents."""
     try:
@@ -160,6 +198,22 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     message: Message
     conversation_id: str
+
+
+# Gmail OAuth models
+class GmailTokenRequest(BaseModel):
+    code: str
+    user_id: str
+
+
+class GmailConnectionStatus(BaseModel):
+    connected: bool
+    email: Optional[str] = None
+    connection_date: Optional[str] = None
+
+
+class GmailDisconnectRequest(BaseModel):
+    user_id: str
 
 
 # Authentication helper function
@@ -535,8 +589,12 @@ async def chat_endpoint(request: ChatRequest):
         # Get context from previous conversations using semantic search
         context = await get_context_for_query(user_id, user_message)
         
-        # Determine if this is a simple message or needs CrewAI agents
-        if is_simple_message(user_message):
+        # Determine message type and route accordingly
+        if is_gmail_query(user_message):
+            # Use Gmail agent for email-related queries
+            loop = asyncio.get_event_loop()
+            ai_response = await loop.run_in_executor(None, process_gmail_query, user_message, user_id)
+        elif is_simple_message(user_message):
             # Use simple AI response for casual conversation
             if context:
                 enhanced_prompt = f"Context from previous conversations:\n{context}\n\nUser message: {user_message}"
@@ -581,6 +639,448 @@ async def chat_endpoint(request: ChatRequest):
             status_code=500, 
             detail="An error occurred while processing your request"
         )
+
+
+# Gmail OAuth endpoints
+@app.get("/auth/gmail/debug/{user_id}")
+async def debug_gmail_oauth(user_id: str):
+    """Debug Gmail OAuth URL generation"""
+    try:
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        redirect_uri = f"{os.getenv('NEXT_PUBLIC_API_URL', 'http://localhost:8000')}/auth/gmail/callback"
+        
+        # Gmail OAuth scopes
+        scopes = [
+            'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/gmail.send',
+            'https://www.googleapis.com/auth/gmail.modify',
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/userinfo.profile'
+        ]
+        scope_string = ' '.join(scopes)
+        
+        # Google OAuth URL parameters
+        from urllib.parse import urlencode
+        auth_params = {
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'scope': scope_string,
+            'access_type': 'offline',
+            'prompt': 'consent',
+            'state': user_id
+        }
+        
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(auth_params)
+        
+        return {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "auth_url": auth_url,
+            "debug_info": {
+                "NEXT_PUBLIC_API_URL": os.getenv('NEXT_PUBLIC_API_URL'),
+                "FRONTEND_URL": os.getenv('FRONTEND_URL'),
+                "environment_variables": {
+                    k: v for k, v in os.environ.items() 
+                    if k.startswith(('GOOGLE_', 'NEXT_', 'FRONTEND_'))
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error debugging Gmail OAuth: {e}")
+        raise HTTPException(status_code=500, detail="Failed to debug OAuth")
+
+
+@app.get("/auth/gmail/authorize")
+async def authorize_gmail(user_id: str):
+    """Initiate Gmail OAuth flow"""
+    try:
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        if not client_id:
+            raise HTTPException(status_code=500, detail="Google OAuth not configured")
+        
+        # Use the redirect URI from environment variable (should match Google Console)
+        redirect_uri = os.getenv('GOOGLE_REDIRECT_URI', f"{os.getenv('NEXT_PUBLIC_API_URL', 'http://localhost:8000')}/auth/gmail/callback")
+        
+        # Gmail OAuth scopes
+        scopes = [
+            'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/gmail.send',
+            'https://www.googleapis.com/auth/gmail.modify',
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/userinfo.profile'
+        ]
+        scope_string = ' '.join(scopes)
+        
+        # Google OAuth URL parameters
+        from urllib.parse import urlencode
+        auth_params = {
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'scope': scope_string,
+            'access_type': 'offline',
+            'prompt': 'consent',
+            'state': user_id
+        }
+        
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(auth_params)
+        
+        # Redirect directly to Google OAuth
+        return RedirectResponse(url=auth_url)
+        
+    except Exception as e:
+        logger.error(f"Error initiating Gmail OAuth: {e}")
+        raise HTTPException(status_code=500, detail="Failed to initiate OAuth")
+
+
+@app.get("/auth/gmail/callback")
+async def gmail_callback(code: str = None, state: str = None, error: str = None):
+    """Handle Gmail OAuth callback"""
+    try:
+        if error:
+            # Return HTML page that closes popup with error
+            html_content = f"""
+            <html>
+            <script>
+                window.opener.postMessage({{
+                    type: 'GMAIL_AUTH_ERROR',
+                    error: '{error}'
+                }}, '*');
+                window.close();
+            </script>
+            </html>
+            """
+            return HTMLResponse(content=html_content)
+        
+        if not code or not state:
+            html_content = """
+            <html>
+            <script>
+                window.opener.postMessage({
+                    type: 'GMAIL_AUTH_ERROR',
+                    error: 'Missing authorization code or state'
+                }, '*');
+                window.close();
+            </script>
+            </html>
+            """
+            return HTMLResponse(content=html_content)
+        
+        user_id = state
+        
+        # Exchange code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        redirect_uri = os.getenv('GOOGLE_REDIRECT_URI', f"{os.getenv('NEXT_PUBLIC_API_URL', 'http://localhost:8000')}/auth/gmail/callback")
+        
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(token_url, data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code"
+            })
+            
+            if token_response.status_code != 200:
+                html_content = """
+                <html>
+                <script>
+                    window.opener.postMessage({
+                        type: 'GMAIL_AUTH_ERROR',
+                        error: 'Failed to exchange code for token'
+                    }, '*');
+                    window.close();
+                </script>
+                </html>
+                """
+                return HTMLResponse(content=html_content)
+            
+            token_data = token_response.json()
+            
+            # Get user email from Google
+            userinfo_url = "https://www.googleapis.com/oauth2/v2/userinfo"
+            headers = {"Authorization": f"Bearer {token_data['access_token']}"}
+            
+            userinfo_response = await client.get(userinfo_url, headers=headers)
+            if userinfo_response.status_code != 200:
+                html_content = """
+                <html>
+                <script>
+                    window.opener.postMessage({
+                        type: 'GMAIL_AUTH_ERROR',
+                        error: 'Failed to get user info'
+                    }, '*');
+                    window.close();
+                </script>
+                </html>
+                """
+                return HTMLResponse(content=html_content)
+            
+            user_info = userinfo_response.json()
+            
+            # Store token in database
+            utc_now = datetime.now(timezone.utc)
+            expires_at = utc_now + timedelta(seconds=token_data.get('expires_in', 3600))
+            
+            supabase.table('oauth_integrations').upsert({
+                'user_id': user_id,
+                'integration_type': 'gmail',
+                'provider_email': user_info['email'],
+                'access_token': token_data['access_token'],
+                'refresh_token': token_data.get('refresh_token'),
+                'token_expires_at': expires_at.isoformat(),
+                'scope': ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'],
+                'status': 'active',
+                'last_used': datetime.now().isoformat()
+            }).execute()
+            
+            # Return success page that closes popup
+            html_content = f"""
+            <html>
+            <script>
+                window.opener.postMessage({{
+                    type: 'GMAIL_AUTH_SUCCESS',
+                    email: '{user_info['email']}'
+                }}, '*');
+                window.close();
+            </script>
+            </html>
+            """
+            return HTMLResponse(content=html_content)
+            
+    except Exception as e:
+        logger.error(f"Error in Gmail callback: {e}")
+        html_content = """
+        <html>
+        <script>
+            window.opener.postMessage({
+                type: 'GMAIL_AUTH_ERROR',
+                error: 'Internal server error'
+            }, '*');
+            window.close();
+        </script>
+        </html>
+        """
+        return HTMLResponse(content=html_content)
+
+
+@app.post("/auth/gmail/store_token")
+async def store_gmail_token(request: GmailTokenRequest):
+    """Store Gmail OAuth token for a user"""
+    try:
+        # Exchange authorization code for access token
+        token_url = "https://oauth2.googleapis.com/token"
+        
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        redirect_uri = f"{os.getenv('FRONTEND_URL', 'http://localhost:3000')}/api/auth/gmail/callback"
+        
+        if not client_id or not client_secret:
+            raise HTTPException(status_code=500, detail="Google OAuth credentials not configured")
+        
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(token_url, data={
+                "code": request.code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code"
+            })
+            
+            if token_response.status_code != 200:
+                raise HTTPException(status_code=400, detail="Failed to exchange code for token")
+            
+            token_data = token_response.json()
+            
+            # Get user email from Google
+            userinfo_url = "https://www.googleapis.com/oauth2/v2/userinfo"
+            headers = {"Authorization": f"Bearer {token_data['access_token']}"}
+            
+            userinfo_response = await client.get(userinfo_url, headers=headers)
+            if userinfo_response.status_code != 200:
+                raise HTTPException(status_code=400, detail="Failed to get user info")
+            
+            user_info = userinfo_response.json()
+            
+            # Store token in database
+            utc_now = datetime.now(timezone.utc)
+            expires_at = utc_now + timedelta(seconds=token_data.get('expires_in', 3600))
+            
+            supabase.table('oauth_integrations').upsert({
+                'user_id': request.user_id,
+                'integration_type': 'gmail',
+                'provider_email': user_info['email'],
+                'access_token': token_data['access_token'],
+                'refresh_token': token_data.get('refresh_token'),
+                'token_expires_at': expires_at.isoformat(),
+                'scope': ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'],
+                'status': 'active',
+                'last_used': datetime.now().isoformat()
+            }).execute()
+            
+            return {"success": True, "email": user_info['email']}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error storing Gmail token: {e}")
+        raise HTTPException(status_code=500, detail="Failed to store Gmail token")
+
+
+@app.get("/auth/gmail/status/{user_id}")
+async def get_gmail_status(user_id: str):
+    """Get Gmail connection status for a user"""
+    try:
+        result = supabase.table('oauth_integrations').select('*').eq('user_id', user_id).eq('integration_type', 'gmail').execute()
+        
+        if not result.data:
+            return GmailConnectionStatus(connected=False)
+        
+        token_data = result.data[0]
+        expires_at = datetime.fromisoformat(token_data['token_expires_at']) if token_data['token_expires_at'] else None
+        
+        # Check if token is still valid (handle timezone-aware comparison)
+        if expires_at:
+            # Make datetime.now() timezone-aware to match the stored timestamp
+            if expires_at.tzinfo is not None:
+                current_time = datetime.now(timezone.utc)
+            else:
+                current_time = datetime.now()
+            
+            if expires_at <= current_time:
+                # Token expired, mark as disconnected
+                return GmailConnectionStatus(connected=False)
+        
+        return GmailConnectionStatus(
+            connected=True,
+            email=token_data['provider_email'],
+            connection_date=token_data['created_at']
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting Gmail status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get Gmail status")
+
+
+@app.delete("/auth/gmail/disconnect")
+async def disconnect_gmail(request: GmailDisconnectRequest):
+    """Disconnect Gmail for a user"""
+    try:
+        # Delete token from database
+        supabase.table('oauth_integrations').delete().eq('user_id', request.user_id).eq('integration_type', 'gmail').execute()
+        
+        return {"success": True, "message": "Gmail disconnected successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error disconnecting Gmail: {e}")
+        raise HTTPException(status_code=500, detail="Failed to disconnect Gmail")
+
+
+# Gmail AI Agent endpoints
+class GmailAgentRequest(BaseModel):
+    user_id: str
+    query: str
+
+@app.post("/gmail/agent/query")
+async def gmail_agent_query(request: GmailAgentRequest):
+    """Process Gmail queries using AI agent"""
+    try:
+        # Validate that user has Gmail connection
+        gmail_status = await get_gmail_status(request.user_id)
+        if not gmail_status.connected:
+            raise HTTPException(status_code=400, detail="Gmail not connected. Please connect Gmail first.")
+        
+        # Process query using Gmail agent
+        response = process_gmail_query(request.query, request.user_id)
+        
+        return {
+            "response": response,
+            "user_id": request.user_id,
+            "query": request.query
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing Gmail agent query: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process Gmail query")
+
+@app.post("/gmail/read")
+async def read_emails_endpoint(request: GmailAgentRequest):
+    """Read recent emails using AI agent"""
+    try:
+        # Create a read-specific query
+        read_query = f"Read my recent emails. {request.query}" if request.query else "Read my recent 10 emails and summarize them."
+        
+        # Process using Gmail agent
+        response = process_gmail_query(read_query, request.user_id)
+        
+        return {
+            "response": response,
+            "user_id": request.user_id,
+            "action": "read_emails"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error reading emails: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read emails")
+
+class GmailSendRequest(BaseModel):
+    user_id: str
+    to_email: str
+    subject: str
+    body: str
+
+@app.post("/gmail/send")
+async def send_email_endpoint(request: GmailSendRequest):
+    """Send email using AI agent"""
+    try:
+        # Create a send-specific query
+        send_query = f"Send an email to {request.to_email} with subject '{request.subject}' and body: {request.body}"
+        
+        # Process using Gmail agent
+        response = process_gmail_query(send_query, request.user_id)
+        
+        return {
+            "response": response,
+            "user_id": request.user_id,
+            "action": "send_email",
+            "to_email": request.to_email,
+            "subject": request.subject
+        }
+        
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send email")
+
+class GmailSearchRequest(BaseModel):
+    user_id: str
+    search_query: str
+
+@app.post("/gmail/search")
+async def search_emails_endpoint(request: GmailSearchRequest):
+    """Search emails using AI agent"""
+    try:
+        # Create a search-specific query
+        search_query = f"Search my emails for: {request.search_query}"
+        
+        # Process using Gmail agent
+        response = process_gmail_query(search_query, request.user_id)
+        
+        return {
+            "response": response,
+            "user_id": request.user_id,
+            "action": "search_emails",
+            "search_query": request.search_query
+        }
+        
+    except Exception as e:
+        logger.error(f"Error searching emails: {e}")
+        raise HTTPException(status_code=500, detail="Failed to search emails")
 
 
 # Conversation management endpoints

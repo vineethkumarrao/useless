@@ -1,6 +1,8 @@
 import * as React from "react";
+import { useState, useEffect } from "react";
 
 import { TeamSwitcher } from "@/components/team-switcher";
+import { GmailConnectDialog } from "@/components/gmail-connect-dialog";
 import {
   Sidebar,
   SidebarContent,
@@ -15,7 +17,7 @@ import {
 } from "@/components/sidebar";
 import {
   RiChat1Line,
-  RiBardLine,
+  RiMailLine,
   RiMickeyLine,
   RiMicLine,
   RiCheckDoubleLine,
@@ -24,6 +26,7 @@ import {
   RiSeedlingLine,
   RiSettings3Line,
 } from "@remixicon/react";
+import { useAuth } from "@/contexts/AuthContext";
 
 // This is sample data.
 const data = {
@@ -53,9 +56,9 @@ const data = {
           isActive: true,
         },
         {
-          title: "Real-time",
+          title: "Gmail",
           url: "#",
-          icon: RiBardLine,
+          icon: RiMailLine,
         },
         {
           title: "Assistants",
@@ -104,6 +107,39 @@ const data = {
 };
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+  const [gmailDialogOpen, setGmailDialogOpen] = useState(false)
+  const [gmailConnected, setGmailConnected] = useState(false)
+  const { user } = useAuth()
+
+  // Check Gmail connection status on mount
+  useEffect(() => {
+    if (user) {
+      checkGmailConnection()
+    }
+  }, [user])
+
+  const checkGmailConnection = async () => {
+    try {
+      const response = await fetch('/api/auth/gmail/status', {
+        headers: {
+          'Authorization': `Bearer ${user?.id}`
+        }
+      })
+      
+      if (response.ok) {
+        const data = await response.json()
+        setGmailConnected(data.connected)
+      }
+    } catch (error) {
+      console.error('Error checking Gmail connection:', error)
+    }
+  }
+
+  const handleGmailClick = (e: React.MouseEvent) => {
+    e.preventDefault()
+    setGmailDialogOpen(true)
+  }
+
   return (
     <Sidebar {...props} className="dark !border-none">
       <SidebarHeader>
@@ -124,15 +160,26 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                     className="group/menu-button font-medium gap-3 h-9 rounded-md data-[active=true]:hover:bg-transparent data-[active=true]:bg-gradient-to-b data-[active=true]:from-sidebar-primary data-[active=true]:to-sidebar-primary/70 data-[active=true]:shadow-[0_1px_2px_0_rgb(0_0_0/.05),inset_0_1px_0_0_rgb(255_255_255/.12)] [&>svg]:size-auto"
                     isActive={item.isActive}
                   >
-                    <a href={item.url}>
-                      {item.icon && (
-                        <item.icon
-                          className="text-sidebar-foreground/50 group-data-[active=true]/menu-button:text-sidebar-foreground"
-                          size={22}
-                          aria-hidden="true"
-                        />
+                    <a 
+                      href={item.url}
+                      onClick={item.title === 'Gmail' ? handleGmailClick : undefined}
+                      className="flex items-center justify-between w-full"
+                    >
+                      <div className="flex items-center gap-3">
+                        {item.icon && (
+                          <item.icon
+                            className="text-sidebar-foreground/50 group-data-[active=true]/menu-button:text-sidebar-foreground"
+                            size={22}
+                            aria-hidden="true"
+                          />
+                        )}
+                        <span>{item.title}</span>
+                      </div>
+                      {item.title === 'Gmail' && gmailConnected && (
+                        <span className="text-xs text-green-400 font-medium">
+                          connected
+                        </span>
                       )}
-                      <span>{item.title}</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -173,6 +220,12 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarFooter>
+
+      {/* Gmail Connect Dialog */}
+      <GmailConnectDialog 
+        open={gmailDialogOpen} 
+        onOpenChange={setGmailDialogOpen}
+      />
     </Sidebar>
   );
 }
