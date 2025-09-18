@@ -16,7 +16,32 @@ import {
   RiPulseLine,
 } from "@remixicon/react";
 
+import { useAuth } from "@/contexts/AuthContext";
+import { useRouter } from "next/navigation";
+
 export default function UserDropdown() {
+  const { user, signOut } = useAuth();
+  const router = useRouter();
+
+  // Generate user initials for avatar fallback
+  const getUserInitials = (fullName?: string) => {
+    if (!fullName) return 'U';
+    const names = fullName.split(' ');
+    const initials = names.map(name => name.charAt(0)).join('');
+    return initials.substring(0, 2).toUpperCase();
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut();
+      router.push('/');
+    } catch (error) {
+      console.error('Error during logout:', error);
+      // Even if there's an error, still redirect to home
+      router.push('/');
+    }
+  };
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -28,17 +53,17 @@ export default function UserDropdown() {
               height={32}
               alt="Profile image"
             />
-            <AvatarFallback>KK</AvatarFallback>
+            <AvatarFallback>{getUserInitials(user?.full_name)}</AvatarFallback>
           </Avatar>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="max-w-64 p-2" align="end">
         <DropdownMenuLabel className="flex min-w-0 flex-col py-0 px-1 mb-2">
           <span className="truncate text-sm font-medium text-foreground mb-0.5">
-            Mary P.
+            {user?.full_name || 'User'}
           </span>
           <span className="truncate text-xs font-normal text-muted-foreground">
-            mary@askdigital.com
+            {user?.email || 'user@example.com'}
           </span>
         </DropdownMenuLabel>
         <DropdownMenuItem className="gap-3 px-1">
@@ -73,7 +98,7 @@ export default function UserDropdown() {
           />
           <span>History</span>
         </DropdownMenuItem>
-        <DropdownMenuItem className="gap-3 px-1">
+        <DropdownMenuItem className="gap-3 px-1" onClick={handleLogout}>
           <RiLogoutCircleLine
             size={20}
             className="text-muted-foreground/70"
