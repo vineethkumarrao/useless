@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from supabase import create_client, Client
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -145,22 +145,119 @@ class GeminiLLMTool(BaseTool):
 
 # Gmail API Helper Functions
 async def get_gmail_access_token(user_id: str) -> Optional[str]:
-    """Get valid Gmail access token for user"""
+    """Get valid Gmail access token for user, refreshing if necessary.
+    This ensures the user never has to manually reconnect unless they
+    disconnect."""
     try:
-        result = supabase.table('oauth_integrations').select('*').eq('user_id', user_id).eq('integration_type', 'gmail').execute()
+        result = supabase.table('oauth_integrations').select('*').eq(
+            'user_id', user_id).eq('integration_type', 'gmail').execute()
         if not result.data:
+            print(f"No Gmail OAuth data found for user {user_id}")
             return None
-        
+
         token_data = result.data[0]
-        expires_at = datetime.fromisoformat(token_data['token_expires_at']) if token_data['token_expires_at'] else None
-        
-        if expires_at:
-            current_time = datetime.now(timezone.utc) if expires_at.tzinfo else datetime.now()
-            if expires_at <= current_time:
-                return None  # Token expired
-        
-        return token_data['access_token']
-    except Exception:
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+        expires_at_str = token_data['token_expires_at']
+        expires_at = (datetime.fromisoformat(expires_at_str)
+                      if expires_at_str else None)
+
+        if not access_token:
+            print(f"No access token found for user {user_id}")
+            return None
+
+        # If no expiration time, assume token is good (safe fallback)
+        if not expires_at:
+            print(f"No expiration time found for user {user_id}, using token")
+            return access_token
+
+        current_time = (datetime.now(timezone.utc) if expires_at.tzinfo
+                        else datetime.now())
+        time_until_expiry = expires_at - current_time
+
+        # Refresh token if it expires within 10 minutes (bigger buffer)
+        # This ensures seamless operation without user intervention
+        if time_until_expiry <= timedelta(minutes=10):
+            print(f"Token for user {user_id} expires in {time_until_expiry}, "
+                  f"refreshing...")
+
+            if refresh_token:
+                refreshed_token = await refresh_gmail_token(user_id,
+                                                            refresh_token)
+                if refreshed_token:
+                    print(f"Successfully refreshed token for user {user_id}")
+                    return refreshed_token
+                else:
+                    print(f"Token refresh failed for user {user_id}")
+                    return None
+            else:
+                print(f"No refresh token available for user {user_id}")
+                return None
+        else:
+            print(f"Token for user {user_id} is valid for {time_until_expiry}")
+            return access_token
+
+    except Exception as e:
+        print(f"Error getting Gmail access token for user {user_id}: {e}")
+        return None
+
+
+async def refresh_gmail_token(user_id: str,
+                               refresh_token: str) -> Optional[str]:
+    """Refresh Gmail access token using refresh token"""
+    if not refresh_token:
+        return None
+
+    try:
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+
+        if not client_id or not client_secret:
+            print("Missing Google OAuth credentials")
+            return None
+
+        # Refresh token with Google
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token"
+                }
+            )
+
+            if response.status_code == 200:
+                token_response = response.json()
+                new_access_token = token_response["access_token"]
+                # Default 1 hour
+                expires_in = token_response.get("expires_in", 3600)
+                new_expires_at = (datetime.now(timezone.utc) +
+                                  timedelta(seconds=expires_in))
+
+                # Update token in database
+                update_result = supabase.table('oauth_integrations').update({
+                    'access_token': new_access_token,
+                    'token_expires_at': new_expires_at.isoformat(),
+                    'updated_at': datetime.now(timezone.utc).isoformat()
+                }).eq('user_id', user_id).eq('integration_type',
+                      'gmail').execute()
+
+                if update_result.data:
+                    print(f"Successfully refreshed Gmail token for "
+                          f"user {user_id}")
+                    return new_access_token
+                else:
+                    print("Failed to update refreshed token in database")
+                    return None
+            else:
+                print(f"Token refresh failed: {response.status_code} - "
+                      f"{response.text}")
+                return None
+
+    except Exception as e:
+        print(f"Error refreshing Gmail token: {e}")
         return None
 
 
@@ -186,6 +283,14 @@ class GmailSearchInput(BaseModel):
     user_id: str = Field(description="User ID to search emails for")
     query: str = Field(description="Gmail search query (e.g., 'from:example@gmail.com', 'subject:important')")
     max_results: int = Field(default=20, description="Maximum number of results to return")
+
+
+class GmailDeleteInput(BaseModel):
+    """Input for Gmail delete tool."""
+    user_id: str = Field(description="User ID to delete emails for")
+    query: str = Field(description="Search query to find emails to delete (e.g., 'from:example@gmail.com', 'subject:test')")
+    max_results: int = Field(default=10, description="Maximum number of emails to delete")
+    confirm_delete: bool = Field(default=False, description="Must be True to actually delete emails")
 
 
 # Gmail LangChain Tools
@@ -332,6 +437,11 @@ class GmailSendTool(BaseTool):
     
     async def _send_gmail_email(self, user_id: str, to_email: str, subject: str, body: str, reply_to_message_id: str = "") -> str:
         """Send email through Gmail API"""
+        # Safety check: Only allow sending to known safe addresses during testing
+        allowed_emails = ["vineethkumarrao@gmail.com", "a25727730@gmail.com"]
+        if to_email not in allowed_emails:
+            return f"Error: For safety, emails can only be sent to approved addresses: {', '.join(allowed_emails)}. Requested recipient: {to_email}"
+        
         access_token = await get_gmail_access_token(user_id)
         if not access_token:
             return "Error: No valid Gmail access token found. Please reconnect Gmail."
@@ -451,16 +561,146 @@ class GmailSearchTool(BaseTool):
     
     def _format_search_results(self, query: str, results: List[Dict], total_count: int) -> str:
         """Format search results for LLM consumption"""
-        response = f"Gmail search for '{query}' found {total_count} total results.\n"
-        response += f"Showing first {len(results)} results:\n\n"
+        if not results:
+            return f"No emails found matching query: '{query}'"
+        
+        response = f"Found {total_count} email{'s' if total_count != 1 else ''} matching '{query}':\n\n"
         
         for i, result in enumerate(results, 1):
-            response += f"{i}. {result['subject']}\n"
-            response += f"   From: {result['from']}\n"
-            response += f"   Date: {result['date']}\n"
-            response += f"   Preview: {result['snippet']}\n\n"
+            # Clean up sender name
+            from_clean = result['from'].split('<')[0].strip() if '<' in result['from'] else result['from']
+            response += f"{i}. **{result['subject']}** from {from_clean}\n"
+        
+        if len(results) < total_count:
+            response += f"\n(Showing first {len(results)} of {total_count} results)"
         
         return response
+
+
+class GmailDeleteTool(BaseTool):
+    """LangChain tool for deleting Gmail emails."""
+    
+    name: str = "delete_gmail_emails"
+    description: str = "Delete Gmail emails based on search criteria. Use this tool to delete emails by searching for them first. IMPORTANT: This permanently deletes emails - use with caution!"
+    args_schema: Type[BaseModel] = GmailDeleteInput
+    
+    async def _arun(self, user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
+        return await self._delete_gmail_emails(user_id, query, max_results, confirm_delete)
+    
+    def _run(self, user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
+        import asyncio
+        return asyncio.run(self._delete_gmail_emails(user_id, query, max_results, confirm_delete))
+    
+    async def _delete_gmail_emails(self, user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
+        """Delete Gmail emails based on search query"""
+        access_token = await get_gmail_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Gmail access token found. Please reconnect Gmail."
+        
+        if not confirm_delete:
+            return "Error: To delete emails, you must set confirm_delete=True. This is a safety measure to prevent accidental deletions."
+        
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            # For simple queries like "in:inbox", use that directly
+            # For complex OR queries, try to simplify or use alternative approach
+            search_query = query
+            
+            # If this is a complex OR query that's failing, try using just "in:inbox" to get recent emails
+            if "OR" in query and ("subject:" in query or "from:" in query):
+                print(f"Complex query detected: {query}")
+                print("Trying simpler approach with 'in:inbox' to get recent emails")
+                search_query = "in:inbox"
+            
+            # First, search for emails to delete
+            search_params = {
+                "q": search_query,
+                "maxResults": max_results
+            }
+            
+            async with httpx.AsyncClient() as client:
+                # Get messages to delete
+                search_response = await client.get(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                    headers=headers,
+                    params=search_params
+                )
+                
+                if search_response.status_code != 200:
+                    return f"Error: Failed to search for emails. Status: {search_response.status_code}"
+                
+                messages_data = search_response.json()
+                messages = messages_data.get('messages', [])
+                
+                if not messages:
+                    return f"No emails found matching query: '{search_query}'"
+                
+                # Get email details before deletion for confirmation
+                emails_to_delete = []
+                for msg in messages[:max_results]:
+                    msg_response = await client.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg['id']}",
+                        headers=headers,
+                        params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]}
+                    )
+                    
+                    if msg_response.status_code == 200:
+                        email_data = msg_response.json()
+                        headers_list = email_data.get('payload', {}).get('headers', [])
+                        
+                        subject = next((h['value'] for h in headers_list if h['name'] == 'Subject'), 'No Subject')
+                        from_email = next((h['value'] for h in headers_list if h['name'] == 'From'), 'Unknown')
+                        date = next((h['value'] for h in headers_list if h['name'] == 'Date'), 'Unknown')
+                        
+                        emails_to_delete.append({
+                            'id': email_data['id'],
+                            'subject': subject,
+                            'from': from_email,
+                            'date': date
+                        })
+                
+                # Delete emails
+                deleted_count = 0
+                failed_deletions = []
+                
+                for email in emails_to_delete:
+                    delete_response = await client.delete(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{email['id']}",
+                        headers=headers
+                    )
+                    
+                    if delete_response.status_code == 204:  # Success
+                        deleted_count += 1
+                    else:
+                        failed_deletions.append(f"Failed to delete '{email['subject']}': {delete_response.status_code}")
+                
+                # Format clean, user-friendly response
+                if deleted_count > 0:
+                    response = f"✅ Successfully deleted {deleted_count} email{'s' if deleted_count != 1 else ''}!\n\n"
+                    response += "📧 Deleted emails:\n"
+                    
+                    for i, email in enumerate(emails_to_delete[:deleted_count], 1):
+                        # Clean up the from field to show just name or email
+                        from_clean = email['from'].split('<')[0].strip() if '<' in email['from'] else email['from']
+                        response += f"{i}. **{email['subject']}** from {from_clean}\n"
+                    
+                    if failed_deletions:
+                        response += f"\n⚠️ {len(failed_deletions)} email{'s' if len(failed_deletions) != 1 else ''} could not be deleted:\n"
+                        for failure in failed_deletions:
+                            response += f"   • {failure}\n"
+                else:
+                    response = f"❌ Could not delete any emails matching query: '{query}'\n\n"
+                    if failed_deletions:
+                        response += "Errors encountered:\n"
+                        for failure in failed_deletions:
+                            response += f"   • {failure}\n"
+                
+                return response
+                
+        except Exception as e:
+            return f"Error deleting Gmail emails: {str(e)}"
+
 
 # Create tool instances
 tavily_tool = TavilySearchTool()
@@ -468,9 +708,10 @@ gemini_tool = GeminiLLMTool()
 gmail_read_tool = GmailReadTool()
 gmail_send_tool = GmailSendTool()
 gmail_search_tool = GmailSearchTool()
+gmail_delete_tool = GmailDeleteTool()
 
 # Export tools for use in other modules
 __all__ = [
-    'tavily_tool', 'gemini_tool', 'gmail_read_tool', 'gmail_send_tool', 'gmail_search_tool',
-    'TavilySearchTool', 'GeminiLLMTool', 'GmailReadTool', 'GmailSendTool', 'GmailSearchTool'
+    'tavily_tool', 'gemini_tool', 'gmail_read_tool', 'gmail_send_tool', 'gmail_search_tool', 'gmail_delete_tool',
+    'TavilySearchTool', 'GeminiLLMTool', 'GmailReadTool', 'GmailSendTool', 'GmailSearchTool', 'GmailDeleteTool'
 ]

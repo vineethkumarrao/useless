@@ -8,6 +8,7 @@ import re
 from dotenv import load_dotenv
 from crewai_agents import process_user_query, get_llm, process_gmail_query
 from auth_service import auth_service
+from langchain_tools import get_gmail_access_token, refresh_gmail_token
 import asyncio
 import logging
 from supabase import create_client, Client
@@ -63,6 +64,21 @@ class ChatResponse(BaseModel):
     type: str  # 'simple' or 'complex'
 
 
+# Add this function after the imports and before other function definitions
+
+async def ensure_valid_gmail_token(user_id: str) -> bool:
+    """Proactively ensure Gmail token is valid and refresh if needed.
+    Returns True if token is valid/refreshed, False if no token or refresh failed.
+    This function ensures users never have to manually reconnect."""
+    try:
+        # This will automatically refresh if token expires within 10 minutes
+        access_token = await get_gmail_access_token(user_id)
+        return access_token is not None
+    except Exception as e:
+        print(f"Error ensuring valid Gmail token for user {user_id}: {e}")
+        return False
+
+
 def is_simple_message(message: str) -> bool:
     """
     Determine if a message is simple and doesn't need CrewAI agents.
@@ -110,19 +126,29 @@ def is_simple_message(message: str) -> bool:
     return False
 
 
-def is_gmail_query(message: str) -> bool:
+def is_gmail_query(message: str, conversation_history: List[dict] = None) -> bool:
     """
     Determine if a message is related to Gmail operations.
-    Returns True for email-related queries.
+    Returns True for email-related queries, including follow-up messages.
     """
     message = message.lower().strip()
+    
+    # Check if previous message in conversation was Gmail-related
+    if conversation_history:
+        # Check last few messages for Gmail context
+        recent_messages = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
+        for msg in recent_messages:
+            if any(keyword in msg.content.lower() for keyword in ['email', 'compose', 'gmail', 'send', 'recipient', 'subject']):
+                # If recent conversation was about email, current message is likely related
+                return True
     
     gmail_keywords = [
         'email', 'emails', 'gmail', 'inbox', 'send email', 'read email',
         'check email', 'summarize email', 'email summary', 'mail',
         'message', 'messages', 'compose', 'reply', 'forward',
         'unread', 'new emails', 'recent emails', 'last week',
-        'email from', 'search email', 'find email', 'delete email'
+        'email from', 'search email', 'find email', 'delete email',
+        'recipient', 'subject', 'body'
     ]
     
     # Check for Gmail-related keywords
@@ -130,13 +156,22 @@ def is_gmail_query(message: str) -> bool:
         if keyword in message:
             return True
     
+    # Check for email addresses
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    if re.search(email_pattern, message):
+        return True
+    
     # Check for common email patterns
     gmail_patterns = [
         r'(check|read|show|get|list|find)\s+(my\s+)?(email|inbox|mail)',
         r'(send|compose|write)\s+(an?\s+)?(email|message)',
         r'(summarize|summary|review)\s+(email|mail)',
         r'email.*from\s+(last\s+)?(week|month|day)',
-        r'(new|recent|unread)\s+(email|mail|message)'
+        r'(new|recent|unread)\s+(email|mail|message)',
+        r'(to|from):\s*\S+@\S+',  # Email format patterns
+        r'subject:\s*',
+        r'send\s+it\s+to',
+        r'email\s+to'
     ]
     
     for pattern in gmail_patterns:
@@ -590,10 +625,30 @@ async def chat_endpoint(request: ChatRequest):
         context = await get_context_for_query(user_id, user_message)
         
         # Determine message type and route accordingly
-        if is_gmail_query(user_message):
-            # Use Gmail agent for email-related queries
-            loop = asyncio.get_event_loop()
-            ai_response = await loop.run_in_executor(None, process_gmail_query, user_message, user_id)
+        if is_gmail_query(user_message, request.messages[:-1]):
+            # Ensure Gmail token is valid before processing query
+            token_valid = await ensure_valid_gmail_token(user_id)
+            if not token_valid:
+                ai_response = ("I notice you want to work with Gmail, but I "
+                               "need you to reconnect your Gmail account. "
+                               "Please disconnect and reconnect Gmail in "
+                               "the settings.")
+            else:
+                # Use Gmail agent for email-related queries
+                conversation_history = "\n".join([
+                    f"{msg.role}: {msg.content}"
+                    for msg in request.messages[:-1]
+                ])
+                full_context = (
+                    f"{context}\n\nCONVERSATION HISTORY:\n"
+                    f"{conversation_history}" if context
+                    else f"CONVERSATION HISTORY:\n{conversation_history}"
+                )
+                loop = asyncio.get_event_loop()
+                ai_response = await loop.run_in_executor(
+                    None, process_gmail_query, user_message, user_id,
+                    full_context
+                )
         elif is_simple_message(user_message):
             # Use simple AI response for casual conversation
             if context:
@@ -649,11 +704,9 @@ async def debug_gmail_oauth(user_id: str):
         client_id = os.getenv("GOOGLE_CLIENT_ID")
         redirect_uri = f"{os.getenv('NEXT_PUBLIC_API_URL', 'http://localhost:8000')}/auth/gmail/callback"
         
-        # Gmail OAuth scopes
+        # Gmail OAuth scopes - using full Gmail access for delete operations
         scopes = [
-            'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/gmail.send',
-            'https://www.googleapis.com/auth/gmail.modify',
+            'https://mail.google.com/',
             'https://www.googleapis.com/auth/userinfo.email',
             'https://www.googleapis.com/auth/userinfo.profile'
         ]
@@ -703,11 +756,9 @@ async def authorize_gmail(user_id: str):
         # Use the redirect URI from environment variable (should match Google Console)
         redirect_uri = os.getenv('GOOGLE_REDIRECT_URI', f"{os.getenv('NEXT_PUBLIC_API_URL', 'http://localhost:8000')}/auth/gmail/callback")
         
-        # Gmail OAuth scopes
+        # Gmail OAuth scopes - using full Gmail access for delete operations
         scopes = [
-            'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/gmail.send',
-            'https://www.googleapis.com/auth/gmail.modify',
+            'https://mail.google.com/',
             'https://www.googleapis.com/auth/userinfo.email',
             'https://www.googleapis.com/auth/userinfo.profile'
         ]
@@ -833,7 +884,9 @@ async def gmail_callback(code: str = None, state: str = None, error: str = None)
                 'access_token': token_data['access_token'],
                 'refresh_token': token_data.get('refresh_token'),
                 'token_expires_at': expires_at.isoformat(),
-                'scope': ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'],
+                'scope': [
+                    'https://mail.google.com/'
+                ],
                 'status': 'active',
                 'last_used': datetime.now().isoformat()
             }).execute()
@@ -917,7 +970,9 @@ async def store_gmail_token(request: GmailTokenRequest):
                 'access_token': token_data['access_token'],
                 'refresh_token': token_data.get('refresh_token'),
                 'token_expires_at': expires_at.isoformat(),
-                'scope': ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send'],
+                'scope': [
+                    'https://mail.google.com/'
+                ],
                 'status': 'active',
                 'last_used': datetime.now().isoformat()
             }).execute()
@@ -980,6 +1035,26 @@ async def disconnect_gmail(request: GmailDisconnectRequest):
         raise HTTPException(status_code=500, detail="Failed to disconnect Gmail")
 
 
+@app.post("/auth/gmail/disconnect/{user_id}")
+async def disconnect_gmail_by_user_id(user_id: str):
+    """Disconnect Gmail for a user (frontend compatibility)"""
+    try:
+        # Delete token from database
+        supabase.table('oauth_integrations').delete().eq(
+            'user_id', user_id
+        ).eq('integration_type', 'gmail').execute()
+        
+        return {"success": True, "message": "Gmail disconnected successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error disconnecting Gmail: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to disconnect Gmail"
+        )
+
+
+
 # Gmail AI Agent endpoints
 class GmailAgentRequest(BaseModel):
     user_id: str
@@ -989,45 +1064,64 @@ class GmailAgentRequest(BaseModel):
 async def gmail_agent_query(request: GmailAgentRequest):
     """Process Gmail queries using AI agent"""
     try:
-        # Validate that user has Gmail connection
-        gmail_status = await get_gmail_status(request.user_id)
-        if not gmail_status.connected:
-            raise HTTPException(status_code=400, detail="Gmail not connected. Please connect Gmail first.")
-        
+        # Ensure Gmail token is valid before processing
+        token_valid = await ensure_valid_gmail_token(request.user_id)
+        if not token_valid:
+            raise HTTPException(
+                status_code=400,
+                detail="Gmail token invalid. Please reconnect Gmail."
+            )
+
         # Process query using Gmail agent
         response = process_gmail_query(request.query, request.user_id)
-        
+
         return {
             "response": response,
             "user_id": request.user_id,
             "query": request.query
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error processing Gmail agent query: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process Gmail query")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process Gmail query"
+        )
 
 @app.post("/gmail/read")
 async def read_emails_endpoint(request: GmailAgentRequest):
     """Read recent emails using AI agent"""
     try:
+        # Ensure Gmail token is valid before processing
+        token_valid = await ensure_valid_gmail_token(request.user_id)
+        if not token_valid:
+            raise HTTPException(
+                status_code=400,
+                detail="Gmail token invalid. Please reconnect Gmail."
+            )
+
         # Create a read-specific query
-        read_query = f"Read my recent emails. {request.query}" if request.query else "Read my recent 10 emails and summarize them."
-        
+        read_query = (f"Read my recent emails. {request.query}"
+                      if request.query
+                      else "Read my recent 10 emails and summarize them.")
+
         # Process using Gmail agent
         response = process_gmail_query(read_query, request.user_id)
-        
+
         return {
             "response": response,
             "user_id": request.user_id,
             "action": "read_emails"
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error reading emails: {e}")
         raise HTTPException(status_code=500, detail="Failed to read emails")
+
 
 class GmailSendRequest(BaseModel):
     user_id: str
@@ -1035,16 +1129,26 @@ class GmailSendRequest(BaseModel):
     subject: str
     body: str
 
+
 @app.post("/gmail/send")
 async def send_email_endpoint(request: GmailSendRequest):
     """Send email using AI agent"""
     try:
+        # Ensure Gmail token is valid before processing
+        token_valid = await ensure_valid_gmail_token(request.user_id)
+        if not token_valid:
+            raise HTTPException(
+                status_code=400,
+                detail="Gmail token invalid. Please reconnect Gmail."
+            )
+
         # Create a send-specific query
-        send_query = f"Send an email to {request.to_email} with subject '{request.subject}' and body: {request.body}"
-        
+        send_query = (f"Send an email to {request.to_email} with "
+                      f"subject '{request.subject}' and body: {request.body}")
+
         # Process using Gmail agent
         response = process_gmail_query(send_query, request.user_id)
-        
+
         return {
             "response": response,
             "user_id": request.user_id,
@@ -1065,19 +1169,29 @@ class GmailSearchRequest(BaseModel):
 async def search_emails_endpoint(request: GmailSearchRequest):
     """Search emails using AI agent"""
     try:
+        # Ensure Gmail token is valid before processing
+        token_valid = await ensure_valid_gmail_token(request.user_id)
+        if not token_valid:
+            raise HTTPException(
+                status_code=400,
+                detail="Gmail token invalid. Please reconnect Gmail."
+            )
+
         # Create a search-specific query
         search_query = f"Search my emails for: {request.search_query}"
-        
+
         # Process using Gmail agent
         response = process_gmail_query(search_query, request.user_id)
-        
+
         return {
             "response": response,
             "user_id": request.user_id,
             "action": "search_emails",
             "search_query": request.search_query
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error searching emails: {e}")
         raise HTTPException(status_code=500, detail="Failed to search emails")

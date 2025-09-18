@@ -104,6 +104,14 @@ def search_gmail_emails(user_id: str, query: str, max_results: int = 20) -> str:
     return tool_instance._run(user_id, query, max_results)
 
 
+@tool
+def delete_gmail_emails(user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
+    """Delete Gmail emails based on search criteria. IMPORTANT: This permanently deletes emails! Use with extreme caution and always ask for user confirmation first."""
+    from langchain_tools import GmailDeleteTool
+    tool_instance = GmailDeleteTool()
+    return tool_instance._run(user_id, query, max_results, confirm_delete)
+
+
 def get_agents():
     """Get fresh agent instances with current LLM configuration."""
     llm = get_llm()
@@ -151,13 +159,13 @@ def get_agents():
     # Define the Gmail Agent
     gmail_agent = Agent(
         role="Gmail Assistant",
-        goal="""You are a specialized Gmail assistant who can read, search, and send emails.
+        goal="""You are a specialized Gmail assistant who can read, search, send, and delete emails.
         Your role is to help users manage their Gmail efficiently and intelligently.""",
         backstory="""You are an intelligent email assistant with deep understanding of email communication patterns.
         You can read emails, understand context, compose professional responses, and help organize email workflows.
         You're expert at email etiquette, can summarize conversations, and provide smart email management suggestions.
-        You always respect privacy and ask for confirmation before sending emails.""",
-        tools=[read_gmail_emails, send_gmail_email, search_gmail_emails],
+        You always respect privacy and ask for confirmation before sending or deleting emails.""",
+        tools=[read_gmail_emails, send_gmail_email, search_gmail_emails, delete_gmail_emails],
         llm=llm,
         verbose=True,
         allow_delegation=False
@@ -249,29 +257,59 @@ def create_crew(user_query: str) -> Crew:
     return crew
 
 
-def process_gmail_query(user_query: str, user_id: str):
-    """Process Gmail-related queries using specialized Gmail agent."""
+def process_gmail_query(user_query: str, user_id: str, conversation_context: str = None):
+    """Process Gmail-related queries using specialized Gmail agent with conversation memory."""
     llm = get_llm()
     
     # Get fresh agents
     _, _, _, gmail_agent = get_agents()
     
+    # Build context-aware description
+    context_prompt = ""
+    if conversation_context:
+        context_prompt = f"""
+        CONVERSATION CONTEXT:
+        {conversation_context}
+        
+        IMPORTANT: This conversation has previous context. If you previously asked the user for information 
+        (like email subject, body, recipient, etc.) and they are now providing it, continue with the task 
+        rather than starting over. Look for patterns where you asked for something and they are responding.
+        """
+    
     # Create Gmail-specific task
     gmail_task = Task(
         description=f"""
+        {context_prompt}
+        
         Handle the following Gmail-related request: "{user_query}"
         User ID: {user_id}
         
         Your task is to:
-        1. Understand what the user wants to do with Gmail (read emails, send email, search, etc.)
-        2. Use the appropriate Gmail tools to fulfill the request
-        3. If sending emails, always ask for confirmation before sending
-        4. Provide clear, helpful responses about email operations
-        5. Respect user privacy and security
+        1. Check the conversation context above to see if this is a continuation of a previous request
+        2. If you previously asked for email details (subject, body, recipient) and user is providing them, proceed with sending
+        3. For new requests: Understand what the user wants to do with Gmail (read emails, send email, search, delete, etc.)
+        4. Use the appropriate Gmail tools to fulfill the request
+        5. If sending emails, ask for missing details (recipient, subject, body) but remember what you already have
+        6. If deleting emails, ALWAYS confirm with the user first and explain which emails will be deleted
+        7. Provide clear, helpful responses about email operations
+        8. Respect user privacy and security
         
         For email reading: Summarize emails clearly and helpfully
-        For email sending: Compose professional, appropriate emails
+        For email sending: Compose professional, appropriate emails and remember previous context
         For email searching: Use relevant search terms and present results clearly
+        For email deleting: 
+        - If user wants to delete "last X emails" or "recent emails", use query "in:inbox" to get recent emails
+        - If user wants to delete specific emails by subject/sender, use simple search terms, not complex OR queries
+        - Show emails in a clear, numbered format: "1. Subject from Sender"  
+        - ALWAYS ask for explicit confirmation: "Do you confirm that you want to delete these X emails?"
+        - Only use delete tool with confirm_delete=True after user explicitly confirms
+        - For "delete them all" or "delete these emails" responses, use "in:inbox" query to delete recent emails
+        - Present results in a clean, simple format
+        - Be very careful with deletion - emails cannot be recovered
+        - NEVER use complex OR queries with multiple subject: and from: combinations - these often fail
+        
+        MEMORY: Always check if you have previous context about email composition before asking for details again.
+        SAFETY: Never delete emails without explicit user confirmation.
         """,
         agent=gmail_agent,
         expected_output="A helpful response about the Gmail operation with clear information about what was done"
