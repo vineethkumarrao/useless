@@ -5,7 +5,7 @@ const PYTHON_BACKEND_URL = 'http://localhost:8000';
 
 export async function POST(request: NextRequest) {
   try {
-    const { messages } = await request.json();
+    const { messages, conversation_id, user_id } = await request.json();
 
     if (!messages || !Array.isArray(messages)) {
       return NextResponse.json({ error: 'Invalid messages' }, { status: 400 });
@@ -13,13 +13,17 @@ export async function POST(request: NextRequest) {
 
     console.log('Proxying request to Python FastAPI backend...');
     
-    // Forward the request to the Python FastAPI backend
+    // Forward the request to the Python FastAPI backend with conversation context
     const response = await fetch(PYTHON_BACKEND_URL + '/chat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ 
+        messages, 
+        conversation_id,
+        user_id
+      }),
     });
 
     if (!response.ok) {

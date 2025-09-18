@@ -101,6 +101,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_user ON public.messages(user_id, created
 CREATE INDEX IF NOT EXISTS idx_messages_embedding ON public.messages 
   USING hnsw (embedding vector_cosine_ops);
 
+-- Function to match messages based on semantic similarity
+CREATE OR REPLACE FUNCTION match_messages(
+  query_embedding vector(384),
+  user_id uuid,
+  match_threshold float,
+  match_count int
+)
+RETURNS setof messages
+LANGUAGE sql
+AS $$
+  SELECT *
+  FROM messages
+  WHERE messages.user_id = user_id
+    AND messages.embedding <=> query_embedding < 1 - match_threshold
+  ORDER BY messages.embedding <=> query_embedding ASC
+  LIMIT least(match_count, 200);
+$$;
+
 -- OAuth integrations table to store external app connections
 CREATE TABLE IF NOT EXISTS public.oauth_integrations (
   id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
