@@ -11,6 +11,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid messages' }, { status: 400 });
     }
 
+    // Get authorization header from the incoming request
+    const authorization = request.headers.get('authorization');
+    if (!authorization) {
+      return NextResponse.json({ error: 'Authorization header required' }, { status: 401 });
+    }
+
     console.log('Proxying request to Python FastAPI backend...');
     
     // Forward the request to the Python FastAPI backend with conversation context
@@ -18,6 +24,7 @@ export async function POST(request: NextRequest) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Authorization': authorization, // Forward the authorization header
       },
       body: JSON.stringify({ 
         messages, 

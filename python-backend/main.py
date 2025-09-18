@@ -133,12 +133,24 @@ def is_gmail_query(message: str, conversation_history: List[dict] = None) -> boo
     """
     message = message.lower().strip()
     
+    # Simple greetings and common phrases should not be treated as Gmail queries
+    simple_phrases = [
+        'hi', 'hello', 'hey', 'greetings', 'good morning', 'good afternoon', 
+        'good evening', 'how are you', 'thanks', 'thank you', 'yes', 'no',
+        'ok', 'okay', 'sure', 'bye', 'goodbye', 'see you', 'tell me a joke',
+        'hello bro', 'what\'s up', 'sup', 'how\'s it going'
+    ]
+    
+    # If the message is a simple phrase, don't treat it as Gmail-related
+    if any(phrase == message or message.startswith(phrase + ' ') for phrase in simple_phrases):
+        return False
+    
     # Check if previous message in conversation was Gmail-related
     if conversation_history:
         # Check last few messages for Gmail context
         recent_messages = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
         for msg in recent_messages:
-            if any(keyword in msg.content.lower() for keyword in ['email', 'compose', 'gmail', 'send', 'recipient', 'subject']):
+            if any(keyword in msg["content"].lower() for keyword in ['email', 'compose', 'gmail', 'send', 'recipient', 'subject']):
                 # If recent conversation was about email, current message is likely related
                 return True
     
@@ -597,104 +609,89 @@ async def get_profile(user_id: str):
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, current_user: str = Depends(get_current_user)):
     """
-    Enhanced chat endpoint with vector storage and semantic search for RAG
+    Main chat endpoint that handles both simple and complex queries.
+    Creates conversation if none provided, saves messages, generates response.
     """
+    print(f"DEBUG: Received chat request")
+    print(f"DEBUG: Current user: {current_user}")
+    print(f"DEBUG: Request type: {type(request)}")
+    print(f"DEBUG: Request dict: {request.dict() if hasattr(request, 'dict') else 'No dict method'}")
+    
+    user_id = current_user
+    conversation_id = request.conversation_id
+    
     try:
-        if not request.messages:
-            raise HTTPException(status_code=400, detail="No messages provided")
+        # Ensure user exists
+        await ensure_user_exists(user_id)
         
-        # Get the latest user message
-        user_message = request.messages[-1].content
-        
-        if not user_message.strip():
-            raise HTTPException(status_code=400, detail="Empty message content")
-        
-        # For now, use a default user_id - in production, extract from JWT
-        user_id = request.user_id or "default-user-id"
-        
-        # Get or create conversation
-        conversation_id = request.conversation_id
+        # If no conversation_id, create new one
         if not conversation_id:
-            # Create new conversation with a smart title
-            title = user_message[:50] + "..." if len(user_message) > 50 else user_message
-            conversation_id = await create_conversation(user_id, title)
+            conversation_id = await create_conversation(user_id)
         
-        # Get context from previous conversations using semantic search
-        context = await get_context_for_query(user_id, user_message)
+        # Save user message
+        user_content = request.messages[-1].content if request.messages else ""
+        await save_message(conversation_id, user_id, user_content, 'user')
         
-        # Determine message type and route accordingly
-        if is_gmail_query(user_message, request.messages[:-1]):
-            # Ensure Gmail token is valid before processing query
-            token_valid = await ensure_valid_gmail_token(user_id)
-            if not token_valid:
-                ai_response = ("I notice you want to work with Gmail, but I "
-                               "need you to reconnect your Gmail account. "
-                               "Please disconnect and reconnect Gmail in "
-                               "the settings.")
-            else:
-                # Use Gmail agent for email-related queries
-                conversation_history = "\n".join([
-                    f"{msg.role}: {msg.content}"
-                    for msg in request.messages[:-1]
-                ])
-                full_context = (
-                    f"{context}\n\nCONVERSATION HISTORY:\n"
-                    f"{conversation_history}" if context
-                    else f"CONVERSATION HISTORY:\n{conversation_history}"
-                )
-                loop = asyncio.get_event_loop()
-                ai_response = await loop.run_in_executor(
-                    None, process_gmail_query, user_message, user_id,
-                    full_context
-                )
-        elif is_simple_message(user_message):
-            # Use simple AI response for casual conversation
-            if context:
-                enhanced_prompt = f"Context from previous conversations:\n{context}\n\nUser message: {user_message}"
-                ai_response = await simple_ai_response(enhanced_prompt)
-            else:
-                ai_response = await simple_ai_response(user_message)
+        # Get conversation history for context
+        history = await get_conversation_messages(conversation_id, user_id)
+        conversation_history = [{"role": msg["role"], "content": msg["content"]} for msg in history]
+        
+        # Determine response type
+        message_text = request.messages[-1].content if request.messages else user_content
+        print(f"DEBUG: message_text = '{message_text}'")
+        print(f"DEBUG: conversation_history = {conversation_history}")
+        is_gmail_related = is_gmail_query(message_text, conversation_history)
+        print(f"DEBUG: is_gmail_related = {is_gmail_related}")
+        is_simple = is_simple_message(message_text)
+        print(f"DEBUG: is_simple = {is_simple}")
+        
+        assistant_content = ""
+        
+        if is_gmail_related:
+            # Handle Gmail queries
+            try:
+                # Ensure Gmail token is valid
+                gmail_valid = await ensure_valid_gmail_token(user_id)
+                if not gmail_valid:
+                    assistant_content = "It looks like you want to work with Gmail, but your connection seems to have expired. Please reconnect your Gmail account in the integrations section."
+                else:
+                    # Process Gmail query
+                    result = process_gmail_query(message_text, user_id, conversation_history)
+                    assistant_content = result
+            except Exception as e:
+                logger.error(f"Gmail query error: {e}")
+                assistant_content = f"I encountered an error while working with your Gmail: {str(e)}. Please try again or check your connection."
+        elif not is_simple:
+            # Complex query - use CrewAI agents
+            try:
+                # Get relevant context from history
+                context = await get_context_for_query(user_id, message_text)
+                full_prompt = f"{context}\n\nCurrent query: {message_text}"
+                result = process_user_query(full_prompt, conversation_history)
+                assistant_content = result
+            except Exception as e:
+                logger.error(f"CrewAI error: {e}")
+                assistant_content = "I had trouble processing your complex request. Please try simplifying your question or try again later."
         else:
-            # Use CrewAI agents for complex queries with context
-            if context:
-                enhanced_query = f"Previous context: {context}\n\nCurrent query: {user_message}"
-                loop = asyncio.get_event_loop()
-                ai_response = await loop.run_in_executor(None, process_user_query, enhanced_query)
-            else:
-                loop = asyncio.get_event_loop()
-                ai_response = await loop.run_in_executor(None, process_user_query, user_message)
+            # Simple response
+            assistant_content = await simple_ai_response(message_text)
         
-        # Save user message to database with embedding
-        await save_message(conversation_id, user_id, user_message, "user")
+        # Save assistant message
+        await save_message(conversation_id, user_id, assistant_content, 'assistant')
         
-        # Save assistant response to database with embedding
-        await save_message(conversation_id, user_id, ai_response, "assistant")
-        
-        # Create response message
-        response_message = Message(
-            role="assistant",
-            content=ai_response
-        )
+        # Update conversation updated_at (trigger should handle, but ensure)
+        supabase.table('conversations').update({'updated_at': datetime.now().isoformat()}).eq('id', conversation_id).execute()
         
         return ChatResponse(
-            message=response_message,
+            message=Message(role="assistant", content=assistant_content),
             conversation_id=conversation_id
         )
         
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
     except Exception as e:
-        # Log the error and return a generic error message
-        print(f"Error in chat endpoint: {str(e)}")
-        logger.error(f"Chat endpoint error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail="An error occurred while processing your request"
-        )
-
+        logger.error(f"Chat endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during chat processing")
 
 # Gmail OAuth endpoints
 @app.get("/auth/gmail/debug/{user_id}")

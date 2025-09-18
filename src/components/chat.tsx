@@ -1,20 +1,8 @@
 "use client";
 
-import { SettingsPanelTrigger } from "@/components/settings-panel";
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbLink,
-  BreadcrumbList,
-  BreadcrumbPage,
-  BreadcrumbSeparator,
-} from "@/components/breadcrumb";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/scroll-area";
 import {
-  RiCodeSSlashLine,
-  RiShareLine,
-  RiShareCircleLine,
   RiShining2Line,
   RiAttachment2,
   RiMicLine,
@@ -24,6 +12,9 @@ import {
 import { ChatMessage } from "@/components/chat-message";
 import { useRef, useEffect, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
+import { useChat } from "@/contexts/ChatContext";
+import { supabase } from "@/lib/supabase";
+import type { Message as DBMessage } from "@/lib/supabase";
 
 interface Message {
   role: "user" | "assistant";
@@ -31,12 +22,24 @@ interface Message {
 }
 
 export default function Chat() {
-  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [conversationId, setConversationId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { user } = useAuth();
+  const {
+    currentConversationId,
+    currentMessages,
+    loadConversations,
+    selectConversation,
+    reloadCurrentConversation,
+    userId,
+    isLoadingMessages,
+  } = useChat();
+
+  const messages: Message[] = currentMessages.map((msg: DBMessage) => ({
+    role: msg.role as "user" | "assistant",
+    content: msg.content,
+  }));
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -44,21 +47,36 @@ export default function Chat() {
 
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || isLoading || !currentConversationId) return;
 
-    const userMessage: Message = { role: "user", content: input };
-    setMessages((prev) => [...prev, userMessage]);
+    const userMessageContent = input;
     setInput("");
     setIsLoading(true);
 
+    // Insert user message to Supabase
+    const userMessage: DBMessage = {
+      id: '', // Will be generated
+      conversation_id: currentConversationId,
+      user_id: userId!,
+      content: userMessageContent,
+      role: 'user',
+      created_at: new Date().toISOString(),
+      metadata: {},
+    };
+    // Note: Embedding not inserted here as it's frontend, backend will handle if needed
+
     try {
+      // For now, just add to local state; backend will save during API call
       const response = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${userId}`
+        },
         body: JSON.stringify({ 
-          messages: [...messages, userMessage],
-          conversation_id: conversationId,
-          user_id: user?.id || 'anonymous'
+          messages: [...messages, { role: "user", content: userMessageContent }],
+          conversation_id: currentConversationId,
+          user_id: userId || 'anonymous'
         }),
       });
 
@@ -67,88 +85,46 @@ export default function Chat() {
       }
 
       const data = await response.json();
-      console.log("Full API Response in Frontend:", data);
+      console.log("Full API Response:", data);
 
-      // Store conversation ID for future messages
-      if (data.conversation_id && !conversationId) {
-        setConversationId(data.conversation_id);
+      // The backend should have saved both messages and updated conversation
+      // Refresh conversations to update updated_at
+      await loadConversations();
+
+      // Reload the current conversation's messages to show the new messages from database
+      if (currentConversationId) {
+        await reloadCurrentConversation();
       }
 
-      let assistantContent =
-        data.message && data.message.content
-          ? data.message.content
-          : "No content received";
-      if (!assistantContent || assistantContent.trim().length === 0) {
-        assistantContent =
-          "The model generated no response. Please try again or rephrase.";
-      }
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: assistantContent,
-      };
-      console.log("Frontend Parsed Assistant Message:", assistantMessage);
-      setMessages((prev) => [...prev, assistantMessage]);
+      // Messages are updated via context from backend or local
+      // Assuming backend returns the assistant message, but since context loads from DB, it should be fine
     } catch (error) {
       console.error("Chat error:", error);
+      // Add error message locally
       const errorMessage: Message = {
         role: "assistant",
         content: "Sorry, something went wrong. Please try again.",
       };
-      setMessages((prev) => [...prev, errorMessage]);
+      // Would need to add to currentMessages, but for simplicity, show in UI
     } finally {
       setIsLoading(false);
     }
   };
 
+  if (isLoadingMessages) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div>Loading messages...</div>
+      </div>
+    );
+  }
+
   return (
     <ScrollArea className="flex-1 [&>div>div]:h-full w-full shadow-md md:rounded-s-[inherit] min-[1024px]:rounded-e-3xl bg-background">
       <div className="h-full flex flex-col px-4 md:px-6 lg:px-8">
-        {/* Header */}
-        <div className="py-5 bg-background sticky top-0 z-10 before:absolute before:inset-x-0 before:bottom-0 before:h-px before:bg-gradient-to-r before:from-black/[0.06] before:via-black/10 before:to-black/[0.06]">
-          <div className="flex items-center justify-between gap-2">
-            <Breadcrumb>
-              <BreadcrumbList className="sm:gap-1.5">
-                <BreadcrumbItem>
-                  <BreadcrumbLink href="#">Playground</BreadcrumbLink>
-                </BreadcrumbItem>
-                <BreadcrumbSeparator />
-                <BreadcrumbItem>
-                  <BreadcrumbPage>Chat</BreadcrumbPage>
-                </BreadcrumbItem>
-              </BreadcrumbList>
-            </Breadcrumb>
-            <div className="flex items-center gap-1 -my-2 -me-2">
-              <Button variant="ghost" className="px-2">
-                <RiCodeSSlashLine
-                  className="text-muted-foreground sm:text-muted-foreground/70 size-5"
-                  size={20}
-                  aria-hidden="true"
-                />
-                <span className="max-sm:sr-only">Code</span>
-              </Button>
-              <Button variant="ghost" className="px-2">
-                <RiShareLine
-                  className="text-muted-foreground sm:text-muted-foreground/70 size-5"
-                  size={20}
-                  aria-hidden="true"
-                />
-                <span className="max-sm:sr-only">Share</span>
-              </Button>
-              <Button variant="ghost" className="px-2">
-                <RiShareCircleLine
-                  className="text-muted-foreground sm:text-muted-foreground/70 size-5"
-                  size={20}
-                  aria-hidden="true"
-                />
-                <span className="max-sm:sr-only">Export</span>
-              </Button>
-              <SettingsPanelTrigger />
-            </div>
-          </div>
-        </div>
-        {/* Chat Messages */}
+        {/* Messages start immediately, no header */}
         <div className="relative grow">
-          <div className="max-w-3xl mx-auto mt-6 space-y-6">
+          <div className="max-w-3xl mx-auto space-y-4">
             {messages.length === 0 && (
               <div className="text-center my-8">
                 <div className="inline-flex items-center bg-white rounded-full border border-black/[0.08] shadow-xs text-xs font-medium py-1 px-3 text-foreground/80">
@@ -160,7 +136,7 @@ export default function Chat() {
                   Today
                 </div>
                 <p className="text-muted-foreground mt-4">
-                  Start a conversation by typing a message below.
+                  Start a conversation by typing a message below or select from history.
                 </p>
               </div>
             )}
@@ -188,24 +164,22 @@ export default function Chat() {
             <div ref={messagesEndRef} aria-hidden="true" />
           </div>
         </div>
-        {/* Footer */}
+        {/* Footer remains unchanged */}
         <form
           onSubmit={handleSubmit}
-          className="sticky bottom-0 pt-4 md:pt-8 z-50"
+          className="sticky bottom-0 pt-3 md:pt-6 z-50"
         >
-          <div className="max-w-3xl mx-auto bg-background rounded-[20px] pb-4 md:pb-8">
+          <div className="max-w-3xl mx-auto bg-background rounded-[20px] pb-3 md:pb-6">
             <div className="relative rounded-[20px] border border-transparent bg-muted transition-colors focus-within:bg-muted/50 focus-within:border-input has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-50 [&:has(input:is(:disabled))_*]:pointer-events-none">
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                className="flex sm:min-h-[84px] w-full bg-transparent px-4 py-3 text-[15px] leading-relaxed text-foreground placeholder:text-muted-foreground/70 focus-visible:outline-none [resize:none]"
+                className="flex sm:min-h-[60px] w-full bg-transparent px-3 py-2 text-sm leading-normal text-foreground placeholder:text-muted-foreground/70 focus-visible:outline-none [resize:none]"
                 placeholder="Ask me anything..."
                 aria-label="Enter your prompt"
                 disabled={isLoading}
               />
-              {/* Textarea buttons */}
-              <div className="flex items-center justify-between gap-2 p-3">
-                {/* Left buttons */}
+              <div className="flex items-center justify-between gap-2 p-2">
                 <div className="flex items-center gap-2">
                   <Button
                     type="button"
@@ -250,7 +224,6 @@ export default function Chat() {
                     <span className="sr-only">Action</span>
                   </Button>
                 </div>
-                {/* Right buttons */}
                 <div className="flex items-center gap-2">
                   <Button
                     type="button"

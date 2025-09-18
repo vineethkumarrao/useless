@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useState, useEffect } from "react";
 
-import { TeamSwitcher } from "@/components/team-switcher";
+import UserDropdown from "@/components/user-dropdown";
 import { GmailConnectDialog } from "@/components/gmail-connect-dialog";
 import {
   Sidebar,
@@ -16,69 +16,26 @@ import {
   SidebarMenuItem,
 } from "@/components/sidebar";
 import {
-  RiChat1Line,
   RiMailLine,
-  RiMickeyLine,
-  RiMicLine,
-  RiCheckDoubleLine,
-  RiBracesLine,
   RiPlanetLine,
   RiSeedlingLine,
   RiSettings3Line,
+  RiAddLine,
+  RiHistoryLine,
 } from "@remixicon/react";
 import { useAuth } from "@/contexts/AuthContext";
+import { useChat } from "@/contexts/ChatContext";
 
-// This is sample data.
 const data = {
-  teams: [
-    {
-      name: "ArkDigital",
-      logo: "https://raw.githubusercontent.com/origin-space/origin-images/refs/heads/main/exp2/logo-01_upxvqe.png",
-    },
-    {
-      name: "Acme Corp.",
-      logo: "https://raw.githubusercontent.com/origin-space/origin-images/refs/heads/main/exp2/logo-01_upxvqe.png",
-    },
-    {
-      name: "Evil Corp.",
-      logo: "https://raw.githubusercontent.com/origin-space/origin-images/refs/heads/main/exp2/logo-01_upxvqe.png",
-    },
-  ],
   navMain: [
     {
-      title: "Playground",
+      title: "Integrations",
       url: "#",
       items: [
-        {
-          title: "Chat",
-          url: "#",
-          icon: RiChat1Line,
-          isActive: true,
-        },
         {
           title: "Gmail",
           url: "#",
           icon: RiMailLine,
-        },
-        {
-          title: "Assistants",
-          url: "#",
-          icon: RiMickeyLine,
-        },
-        {
-          title: "Audio",
-          url: "#",
-          icon: RiMicLine,
-        },
-        {
-          title: "Metrics",
-          url: "#",
-          icon: RiCheckDoubleLine,
-        },
-        {
-          title: "Documentation",
-          url: "#",
-          icon: RiBracesLine,
         },
       ],
     },
@@ -107,16 +64,22 @@ const data = {
 };
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
-  const [gmailDialogOpen, setGmailDialogOpen] = useState(false)
-  const [gmailConnected, setGmailConnected] = useState(false)
-  const { user } = useAuth()
+  const [gmailDialogOpen, setGmailDialogOpen] = useState(false);
+  const [gmailConnected, setGmailConnected] = useState(false);
+  const { user } = useAuth();
+  const { 
+    conversations, 
+    currentConversationId, 
+    isLoadingConversations, 
+    createNewConversation, 
+    selectConversation 
+  } = useChat();
 
-  // Check Gmail connection status on mount
   useEffect(() => {
     if (user) {
-      checkGmailConnection()
+      checkGmailConnection();
     }
-  }, [user])
+  }, [user]);
 
   const checkGmailConnection = async () => {
     try {
@@ -124,29 +87,104 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         headers: {
           'Authorization': `Bearer ${user?.id}`
         }
-      })
+      });
       
       if (response.ok) {
-        const data = await response.json()
-        setGmailConnected(data.connected)
+        const data = await response.json();
+        setGmailConnected(data.connected);
       }
     } catch (error) {
-      console.error('Error checking Gmail connection:', error)
+      console.error('Error checking Gmail connection:', error);
     }
-  }
+  };
 
   const handleGmailClick = (e: React.MouseEvent) => {
-    e.preventDefault()
-    setGmailDialogOpen(true)
-  }
+    e.preventDefault();
+    setGmailDialogOpen(true);
+  };
+
+  const handleNewChat = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    await createNewConversation();
+  };
+
+  const handleSelectConversation = (conversationId: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    selectConversation(conversationId);
+  };
 
   return (
     <Sidebar {...props} className="dark !border-none">
       <SidebarHeader>
-        <TeamSwitcher teams={data.teams} />
+        <div className="p-4">
+          <UserDropdown />
+        </div>
       </SidebarHeader>
       <SidebarContent>
-        {/* We only show the first parent group */}
+        <SidebarGroup>
+          <SidebarGroupContent className="px-2">
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  asChild
+                  className="group/menu-button font-medium gap-3 h-9 rounded-md hover:bg-sidebar-accent [&>svg]:size-auto"
+                >
+                  <button onClick={handleNewChat} className="flex items-center w-full">
+                    <RiAddLine size={22} className="text-sidebar-foreground/50" />
+                    <span>New Chat</span>
+                  </button>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel className="uppercase text-sidebar-foreground/50">
+            History
+          </SidebarGroupLabel>
+          <SidebarGroupContent className="px-2 max-h-96 overflow-y-auto">
+            <SidebarMenu>
+              {isLoadingConversations ? (
+                <SidebarMenuItem>
+                  <div className="flex items-center gap-3 h-9 px-2">
+                    <div className="animate-pulse bg-muted rounded w-5 h-5" />
+                    <div className="animate-pulse bg-muted rounded w-32 h-4" />
+                  </div>
+                </SidebarMenuItem>
+              ) : conversations.length === 0 ? (
+                <SidebarMenuItem>
+                  <span className="text-xs text-muted-foreground px-2">No conversations yet</span>
+                </SidebarMenuItem>
+              ) : (
+                conversations.slice(0, 10).map((conversation) => (
+                  <SidebarMenuItem key={conversation.id}>
+                    <SidebarMenuButton
+                      asChild
+                      className="group/menu-button font-medium gap-3 h-9 rounded-md data-[active=true]:hover:bg-transparent data-[active=true]:bg-gradient-to-b data-[active=true]:from-sidebar-primary data-[active=true]:to-sidebar-primary/70 data-[active=true]:shadow-[0_1px_2px_0_rgb(0_0_0/.05),inset_0_1px_0_0_rgb(255_255_255/.12)] [&>svg]:size-auto"
+                      isActive={conversation.id === currentConversationId}
+                    >
+                      <button 
+                        onClick={(e) => handleSelectConversation(conversation.id, e)}
+                        className="flex items-center justify-between w-full"
+                      >
+                        <div className="flex items-center gap-3">
+                          <RiHistoryLine size={16} className="text-sidebar-foreground/50" />
+                          <span className="truncate max-w-32 text-left">{conversation.title}</span>
+                        </div>
+                        <span className="text-xs text-muted-foreground">
+                          {new Date(conversation.updated_at).toLocaleDateString()}
+                        </span>
+                      </button>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))
+              )}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+      <SidebarFooter>
         <SidebarGroup>
           <SidebarGroupLabel className="uppercase text-sidebar-foreground/50">
             {data.navMain[0]?.title}
@@ -158,7 +196,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                   <SidebarMenuButton
                     asChild
                     className="group/menu-button font-medium gap-3 h-9 rounded-md data-[active=true]:hover:bg-transparent data-[active=true]:bg-gradient-to-b data-[active=true]:from-sidebar-primary data-[active=true]:to-sidebar-primary/70 data-[active=true]:shadow-[0_1px_2px_0_rgb(0_0_0/.05),inset_0_1px_0_0_rgb(255_255_255/.12)] [&>svg]:size-auto"
-                    isActive={item.isActive}
+                    isActive={false}
                   >
                     <a 
                       href={item.url}
@@ -187,9 +225,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
-      </SidebarContent>
-      <SidebarFooter>
-        {/* Secondary Navigation */}
+
         <SidebarGroup>
           <SidebarGroupLabel className="uppercase text-sidebar-foreground/50">
             {data.navMain[1]?.title}
@@ -201,7 +237,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                   <SidebarMenuButton
                     asChild
                     className="group/menu-button font-medium gap-3 h-9 rounded-md [&>svg]:size-auto"
-                    isActive={item.isActive}
+                    isActive={false}
                   >
                     <a href={item.url}>
                       {item.icon && (
@@ -221,7 +257,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         </SidebarGroup>
       </SidebarFooter>
 
-      {/* Gmail Connect Dialog */}
       <GmailConnectDialog 
         open={gmailDialogOpen} 
         onOpenChange={setGmailDialogOpen}
