@@ -2,7 +2,11 @@ import * as React from "react";
 import { useState, useEffect } from "react";
 
 import UserDropdown from "@/components/user-dropdown";
-import { GmailConnectDialog } from "@/components/gmail-connect-dialog";
+import { GmailConnectDialog } from "@/components/gmail-connect-dialog"
+import { GoogleCalendarConnectDialog } from "@/components/google-calendar-connect-dialog"
+import { GoogleDocsConnectDialog } from "@/components/google-docs-connect-dialog"
+import { NotionConnectDialog } from "@/components/notion-connect-dialog"
+import { GitHubConnectDialog } from "@/components/github-connect-dialog";
 import {
   Sidebar,
   SidebarContent,
@@ -17,11 +21,14 @@ import {
 } from "@/components/sidebar";
 import {
   RiMailLine,
-  RiPlanetLine,
   RiSeedlingLine,
   RiSettings3Line,
   RiAddLine,
   RiHistoryLine,
+  RiCalendarLine,
+  RiFileTextLine,
+  RiNotionLine,
+  RiGithubLine,
 } from "@remixicon/react";
 import { useAuth } from "@/contexts/AuthContext";
 import { useChat } from "@/contexts/ChatContext";
@@ -37,26 +44,25 @@ const data = {
           url: "#",
           icon: RiMailLine,
         },
-      ],
-    },
-    {
-      title: "More",
-      url: "#",
-      items: [
         {
-          title: "Community",
+          title: "Google Calendar",
           url: "#",
-          icon: RiPlanetLine,
+          icon: RiCalendarLine,
         },
         {
-          title: "Help Centre",
+          title: "Google Docs",
           url: "#",
-          icon: RiSeedlingLine,
+          icon: RiFileTextLine,
         },
         {
-          title: "Settings",
+          title: "Notion",
           url: "#",
-          icon: RiSettings3Line,
+          icon: RiNotionLine,
+        },
+        {
+          title: "GitHub",
+          url: "#",
+          icon: RiGithubLine,
         },
       ],
     },
@@ -65,7 +71,17 @@ const data = {
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const [gmailDialogOpen, setGmailDialogOpen] = useState(false);
+  const [calendarDialogOpen, setCalendarDialogOpen] = useState(false);
+  const [docsDialogOpen, setDocsDialogOpen] = useState(false);
+  const [notionDialogOpen, setNotionDialogOpen] = useState(false);
+  const [githubDialogOpen, setGithubDialogOpen] = useState(false);
+  
   const [gmailConnected, setGmailConnected] = useState(false);
+  const [calendarConnected, setCalendarConnected] = useState(false);
+  const [docsConnected, setDocsConnected] = useState(false);
+  const [notionConnected, setNotionConnected] = useState(false);
+  const [githubConnected, setGithubConnected] = useState(false);
+  
   const { user } = useAuth();
   const { 
     conversations, 
@@ -77,9 +93,19 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
 
   useEffect(() => {
     if (user) {
-      checkGmailConnection();
+      checkAllIntegrations();
     }
   }, [user]);
+
+  const checkAllIntegrations = async () => {
+    await Promise.all([
+      checkGmailConnection(),
+      checkCalendarConnection(),
+      checkDocsConnection(),
+      checkNotionConnection(),
+      checkGithubConnection(),
+    ]);
+  };
 
   const checkGmailConnection = async () => {
     try {
@@ -98,9 +124,110 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     }
   };
 
-  const handleGmailClick = (e: React.MouseEvent) => {
+  const checkCalendarConnection = async () => {
+    try {
+      const response = await fetch('/api/auth/google-calendar/status', {
+        headers: {
+          'Authorization': `Bearer ${user?.id}`
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setCalendarConnected(data.connected);
+      }
+    } catch (error) {
+      console.error('Error checking Calendar connection:', error);
+    }
+  };
+
+  const checkDocsConnection = async () => {
+    try {
+      const response = await fetch('/api/auth/google-docs/status', {
+        headers: {
+          'Authorization': `Bearer ${user?.id}`
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setDocsConnected(data.connected);
+      }
+    } catch (error) {
+      console.error('Error checking Docs connection:', error);
+    }
+  };
+
+  const checkNotionConnection = async () => {
+    try {
+      const response = await fetch('/api/auth/notion/status', {
+        headers: {
+          'Authorization': `Bearer ${user?.id}`
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setNotionConnected(data.connected);
+      }
+    } catch (error) {
+      console.error('Error checking Notion connection:', error);
+    }
+  };
+
+  const checkGithubConnection = async () => {
+    try {
+      const response = await fetch('/api/auth/github/status', {
+        headers: {
+          'Authorization': `Bearer ${user?.id}`
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setGithubConnected(data.connected);
+      }
+    } catch (error) {
+      console.error('Error checking GitHub connection:', error);
+    }
+  };
+
+  const handleIntegrationClick = (integrationName: string) => (e: React.MouseEvent) => {
     e.preventDefault();
-    setGmailDialogOpen(true);
+    switch (integrationName) {
+      case 'Gmail':
+        setGmailDialogOpen(true);
+        break;
+      case 'Google Calendar':
+        setCalendarDialogOpen(true);
+        break;
+      case 'Google Docs':
+        setDocsDialogOpen(true);
+        break;
+      case 'Notion':
+        setNotionDialogOpen(true);
+        break;
+      case 'GitHub':
+        setGithubDialogOpen(true);
+        break;
+    }
+  };
+
+  const getConnectionStatus = (integrationName: string) => {
+    switch (integrationName) {
+      case 'Gmail':
+        return gmailConnected;
+      case 'Google Calendar':
+        return calendarConnected;
+      case 'Google Docs':
+        return docsConnected;
+      case 'Notion':
+        return notionConnected;
+      case 'GitHub':
+        return githubConnected;
+      default:
+        return false;
+    }
   };
 
   const handleNewChat = async (e: React.MouseEvent) => {
@@ -200,7 +327,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                   >
                     <a 
                       href={item.url}
-                      onClick={item.title === 'Gmail' ? handleGmailClick : undefined}
+                      onClick={handleIntegrationClick(item.title)}
                       className="flex items-center justify-between w-full"
                     >
                       <div className="flex items-center gap-3">
@@ -213,41 +340,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                         )}
                         <span>{item.title}</span>
                       </div>
-                      {item.title === 'Gmail' && gmailConnected && (
+                      {getConnectionStatus(item.title) && (
                         <span className="text-xs text-green-400 font-medium">
                           connected
                         </span>
                       )}
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup>
-          <SidebarGroupLabel className="uppercase text-sidebar-foreground/50">
-            {data.navMain[1]?.title}
-          </SidebarGroupLabel>
-          <SidebarGroupContent className="px-2">
-            <SidebarMenu>
-              {data.navMain[1]?.items.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton
-                    asChild
-                    className="group/menu-button font-medium gap-3 h-9 rounded-md [&>svg]:size-auto"
-                    isActive={false}
-                  >
-                    <a href={item.url}>
-                      {item.icon && (
-                        <item.icon
-                          className="text-sidebar-foreground/50 group-data-[active=true]/menu-button:text-primary"
-                          size={22}
-                          aria-hidden="true"
-                        />
-                      )}
-                      <span>{item.title}</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -260,6 +357,23 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       <GmailConnectDialog 
         open={gmailDialogOpen} 
         onOpenChange={setGmailDialogOpen}
+      />
+      
+      <GoogleCalendarConnectDialog 
+        open={calendarDialogOpen} 
+        onOpenChange={setCalendarDialogOpen}
+      />
+      <GoogleDocsConnectDialog 
+        open={docsDialogOpen} 
+        onOpenChange={setDocsDialogOpen}
+      />
+      <NotionConnectDialog 
+        open={notionDialogOpen} 
+        onOpenChange={setNotionDialogOpen}
+      />
+      <GitHubConnectDialog 
+        open={githubDialogOpen} 
+        onOpenChange={setGithubDialogOpen}
       />
     </Sidebar>
   );

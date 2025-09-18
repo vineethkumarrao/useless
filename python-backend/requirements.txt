@@ -37,3 +37,20 @@ supabase==2.3.0
 resend==0.8.0
 cryptography==41.0.7
 email-validator==2.1.0
+
+# Google API client libraries for Calendar, Docs, Gmail
+google-auth==2.25.2
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1
+google-api-python-client==2.109.0
+google-api-core==2.14.0
+
+# GitHub API client
+PyGithub==2.1.1
+
+# Notion API client  
+notion-client==2.2.1
+
+# Vector embeddings and similarity search
+sentence-transformers==2.2.2
+numpy==1.24.3

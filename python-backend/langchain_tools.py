@@ -18,6 +18,32 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from supabase import create_client, Client
+
+def run_async_in_thread(coro):
+    """Helper function to run async code in sync context"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If there's already a running loop, use asyncio.create_task
+            import concurrent.futures
+            import threading
+            
+            def run_in_thread():
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                try:
+                    return new_loop.run_until_complete(coro)
+                finally:
+                    new_loop.close()
+            
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(run_in_thread)
+                return future.result()
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        # No event loop exists, create a new one
+        return run_async_in_thread(coro)
 from datetime import datetime, timezone, timedelta
 
 # Load environment variables
@@ -51,7 +77,7 @@ class TavilySearchTool(BaseTool):
     
     def _run(self, query: str, max_results: int = 3) -> str:
         """Sync implementation of Tavily search."""
-        return asyncio.run(self._search_tavily(query, max_results))
+        return run_async_in_thread(self._search_tavily(query, max_results))
     
     async def _search_tavily(self, query: str, max_results: int = 3, retries: int = 3) -> str:
         """Perform Tavily search with retry logic."""
@@ -310,7 +336,7 @@ class GmailReadTool(BaseTool):
     
     def _run(self, user_id: str, max_results: int = 10, query: str = "") -> str:
         """Sync implementation of Gmail read."""
-        return asyncio.run(self._read_gmail_emails(user_id, max_results, query))
+        return run_async_in_thread(self._read_gmail_emails(user_id, max_results, query))
     
     async def _read_gmail_emails(self, user_id: str, max_results: int = 10, query: str = "") -> str:
         """Read emails from Gmail using API"""
@@ -433,7 +459,7 @@ class GmailSendTool(BaseTool):
     
     def _run(self, user_id: str, to_email: str, subject: str, body: str, reply_to_message_id: str = "") -> str:
         """Sync implementation of Gmail send."""
-        return asyncio.run(self._send_gmail_email(user_id, to_email, subject, body, reply_to_message_id))
+        return run_async_in_thread(self._send_gmail_email(user_id, to_email, subject, body, reply_to_message_id))
     
     async def _send_gmail_email(self, user_id: str, to_email: str, subject: str, body: str, reply_to_message_id: str = "") -> str:
         """Send email through Gmail API"""
@@ -499,7 +525,7 @@ class GmailSearchTool(BaseTool):
     
     def _run(self, user_id: str, query: str, max_results: int = 20) -> str:
         """Sync implementation of Gmail search."""
-        return asyncio.run(self._search_gmail_emails(user_id, query, max_results))
+        return run_async_in_thread(self._search_gmail_emails(user_id, query, max_results))
     
     async def _search_gmail_emails(self, user_id: str, query: str, max_results: int = 20) -> str:
         """Search emails in Gmail using API"""
@@ -589,7 +615,7 @@ class GmailDeleteTool(BaseTool):
     
     def _run(self, user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
         import asyncio
-        return asyncio.run(self._delete_gmail_emails(user_id, query, max_results, confirm_delete))
+        return run_async_in_thread(self._delete_gmail_emails(user_id, query, max_results, confirm_delete))
     
     async def _delete_gmail_emails(self, user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
         """Delete Gmail emails based on search query"""
@@ -710,8 +736,1780 @@ gmail_send_tool = GmailSendTool()
 gmail_search_tool = GmailSearchTool()
 gmail_delete_tool = GmailDeleteTool()
 
+
+# =============================================================================
+# GOOGLE CALENDAR TOOLS
+# =============================================================================
+
+class GoogleCalendarListInput(BaseModel):
+    """Input for Google Calendar list events tool."""
+    user_id: str = Field(description="User ID to get calendar access for")
+    days_ahead: int = Field(default=7, description="Number of days ahead to look for events")
+    max_results: int = Field(default=10, description="Maximum number of events to return")
+    calendar_id: str = Field(default="primary", description="Calendar ID (default: primary)")
+
+class GoogleCalendarCreateInput(BaseModel):
+    """Input for Google Calendar create event tool."""
+    user_id: str = Field(description="User ID to create calendar event for")
+    title: str = Field(description="Event title/summary")
+    description: str = Field(default="", description="Event description")
+    start_datetime: str = Field(description="Start datetime in ISO format (e.g., '2025-09-18T14:00:00')")
+    end_datetime: str = Field(description="End datetime in ISO format (e.g., '2025-09-18T15:00:00')")
+    timezone: str = Field(default="UTC", description="Timezone for the event")
+    calendar_id: str = Field(default="primary", description="Calendar ID (default: primary)")
+    attendees: List[str] = Field(default=[], description="List of attendee email addresses")
+
+class GoogleCalendarUpdateInput(BaseModel):
+    """Input for Google Calendar update event tool."""
+    user_id: str = Field(description="User ID to update calendar event for")
+    event_id: str = Field(description="Event ID to update")
+    title: str = Field(default="", description="New event title (optional)")
+    description: str = Field(default="", description="New event description (optional)")
+    start_datetime: str = Field(default="", description="New start datetime in ISO format (optional)")
+    end_datetime: str = Field(default="", description="New end datetime in ISO format (optional)")
+    calendar_id: str = Field(default="primary", description="Calendar ID (default: primary)")
+
+class GoogleCalendarDeleteInput(BaseModel):
+    """Input for Google Calendar delete event tool."""
+    user_id: str = Field(description="User ID to delete calendar event for")
+    event_id: str = Field(description="Event ID to delete")
+    calendar_id: str = Field(default="primary", description="Calendar ID (default: primary)")
+
+async def get_google_calendar_access_token(user_id: str) -> Optional[str]:
+    """Get valid Google Calendar access token for user"""
+    try:
+        result = supabase.table('oauth_integrations').select('*').eq('user_id', user_id).eq('integration_type', 'google_calendar').execute()
+        
+        if not result.data:
+            return None
+        
+        token_data = result.data[0]
+        access_token = token_data['access_token']
+        refresh_token = token_data.get('refresh_token')
+        expires_at = token_data.get('token_expires_at')
+        
+        # Check if token is expired and refresh if needed
+        if expires_at:
+            expires_datetime = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            if expires_datetime <= datetime.now(timezone.utc):
+                # Token expired, try to refresh
+                if refresh_token:
+                    new_token = await refresh_google_token(refresh_token, user_id, 'google_calendar')
+                    return new_token
+                else:
+                    return None
+        
+        return access_token
+    except Exception as e:
+        print(f"Error getting Google Calendar access token: {e}")
+        return None
+
+async def refresh_google_token(refresh_token: str, user_id: str, integration_type: str) -> Optional[str]:
+    """Refresh Google OAuth token"""
+    try:
+        token_url = "https://oauth2.googleapis.com/token"
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret
+            })
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                new_access_token = token_data['access_token']
+                expires_in = token_data.get('expires_in', 3600)
+                
+                # Update token in database
+                expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                supabase.table('oauth_integrations').update({
+                    'access_token': new_access_token,
+                    'token_expires_at': expires_at.isoformat(),
+                    'last_used': datetime.now().isoformat()
+                }).eq('user_id', user_id).eq('integration_type', integration_type).execute()
+                
+                return new_access_token
+            else:
+                return None
+    except Exception as e:
+        print(f"Error refreshing Google token: {e}")
+        return None
+
+class GoogleCalendarListTool(BaseTool):
+    """LangChain tool for listing Google Calendar events."""
+    
+    name: str = "google_calendar_list_events"
+    description: str = """
+    List upcoming events from Google Calendar. 
+    Use this tool to check calendar schedule, find meeting times, or see upcoming appointments.
+    Returns events with titles, times, descriptions, and attendees.
+    """
+    args_schema: type[GoogleCalendarListInput] = GoogleCalendarListInput
+    
+    async def _arun(self, user_id: str, days_ahead: int = 7, max_results: int = 10, calendar_id: str = "primary") -> str:
+        """Async implementation of Google Calendar list events."""
+        return await self._list_calendar_events(user_id, days_ahead, max_results, calendar_id)
+    
+    def _run(self, user_id: str, days_ahead: int = 7, max_results: int = 10, calendar_id: str = "primary") -> str:
+        """Sync implementation of Google Calendar list events."""
+        return run_async_in_thread(self._list_calendar_events(user_id, days_ahead, max_results, calendar_id))
+    
+    async def _list_calendar_events(self, user_id: str, days_ahead: int = 7, max_results: int = 10, calendar_id: str = "primary") -> str:
+        """List events from Google Calendar"""
+        access_token = await get_google_calendar_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Calendar access token found. Please connect Google Calendar."
+        
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            # Get current time and time range
+            now = datetime.now(timezone.utc)
+            time_max = now + timedelta(days=days_ahead)
+            
+            params = {
+                "timeMin": now.isoformat(),
+                "timeMax": time_max.isoformat(),
+                "maxResults": max_results,
+                "singleEvents": True,
+                "orderBy": "startTime"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+                    headers=headers,
+                    params=params
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to fetch calendar events. Status: {response.status_code}"
+                
+                events_data = response.json()
+                events = events_data.get('items', [])
+                
+                if not events:
+                    return f"No upcoming events found in the next {days_ahead} days."
+                
+                result = f"Upcoming Calendar Events (next {days_ahead} days):\n\n"
+                for i, event in enumerate(events, 1):
+                    title = event.get('summary', 'No Title')
+                    description = event.get('description', '')
+                    
+                    # Handle start/end times
+                    start = event.get('start', {})
+                    end = event.get('end', {})
+                    
+                    start_time = start.get('dateTime', start.get('date', ''))
+                    end_time = end.get('dateTime', end.get('date', ''))
+                    
+                    # Format attendees
+                    attendees = event.get('attendees', [])
+                    attendee_list = ', '.join([att.get('email', '') for att in attendees])
+                    
+                    result += f"{i}. {title}\n"
+                    result += f"   Time: {start_time} to {end_time}\n"
+                    if description:
+                        result += f"   Description: {description}\n"
+                    if attendee_list:
+                        result += f"   Attendees: {attendee_list}\n"
+                    result += f"   Event ID: {event.get('id', '')}\n\n"
+                
+                return result
+                
+        except Exception as e:
+            return f"Error reading calendar events: {str(e)}"
+
+class GoogleCalendarCreateTool(BaseTool):
+    """LangChain tool for creating Google Calendar events."""
+    
+    name: str = "google_calendar_create_event"
+    description: str = """
+    Create a new event in Google Calendar.
+    Use this tool to schedule meetings, appointments, or reminders.
+    Requires title, start time, and end time. Can optionally include description and attendees.
+    """
+    args_schema: type[GoogleCalendarCreateInput] = GoogleCalendarCreateInput
+    
+    async def _arun(self, user_id: str, title: str, start_datetime: str, end_datetime: str, 
+                   description: str = "", timezone: str = "UTC", calendar_id: str = "primary", 
+                   attendees: List[str] = []) -> str:
+        """Async implementation of Google Calendar create event."""
+        return await self._create_calendar_event(user_id, title, start_datetime, end_datetime, 
+                                                description, timezone, calendar_id, attendees)
+    
+    def _run(self, user_id: str, title: str, start_datetime: str, end_datetime: str, 
+             description: str = "", timezone: str = "UTC", calendar_id: str = "primary", 
+             attendees: List[str] = []) -> str:
+        """Sync implementation of Google Calendar create event."""
+        return run_async_in_thread(self._create_calendar_event(user_id, title, start_datetime, end_datetime, 
+                                                      description, timezone, calendar_id, attendees))
+    
+    async def _create_calendar_event(self, user_id: str, title: str, start_datetime: str, end_datetime: str, 
+                                   description: str = "", timezone: str = "UTC", calendar_id: str = "primary", 
+                                   attendees: List[str] = []) -> str:
+        """Create a new event in Google Calendar"""
+        access_token = await get_google_calendar_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Calendar access token found. Please connect Google Calendar."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Fix timezone handling - convert UTC to proper timezone format
+            def fix_datetime_format(dt_str, tz):
+                """Ensure datetime has proper timezone format for Google Calendar"""
+                from datetime import datetime
+                import re
+                
+                # If datetime string doesn't have timezone info, add it
+                if not dt_str.endswith('Z') and '+' not in dt_str and dt_str.count(':') == 2:
+                    # Parse the datetime and add timezone
+                    try:
+                        dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+                        # Format with timezone offset
+                        return dt.strftime('%Y-%m-%dT%H:%M:%S-05:00')  # EST timezone
+                    except:
+                        return dt_str
+                return dt_str
+            
+            # Use local timezone (EST) for better user experience
+            user_timezone = "America/New_York"
+            fixed_start = fix_datetime_format(start_datetime, user_timezone)
+            fixed_end = fix_datetime_format(end_datetime, user_timezone)
+            
+            # Build event data
+            event_data = {
+                "summary": title,
+                "description": description,
+                "start": {
+                    "dateTime": fixed_start,
+                    "timeZone": user_timezone
+                },
+                "end": {
+                    "dateTime": fixed_end,
+                    "timeZone": user_timezone
+                }
+            }
+            
+            # Add attendees if provided
+            if attendees:
+                event_data["attendees"] = [{"email": email} for email in attendees]
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+                    headers=headers,
+                    json=event_data
+                )
+                
+                if response.status_code == 200:
+                    event = response.json()
+                    event_id = event.get('id', '')
+                    html_link = event.get('htmlLink', '')
+                    return f"Successfully created calendar event '{title}' (ID: {event_id}). View at: {html_link}"
+                else:
+                    error_data = response.json() if response.content else {}
+                    return f"Error: Failed to create calendar event. Status: {response.status_code}, Details: {error_data}"
+                
+        except Exception as e:
+            return f"Error creating calendar event: {str(e)}"
+
+class GoogleCalendarUpdateTool(BaseTool):
+    """LangChain tool for updating Google Calendar events."""
+    
+    name: str = "google_calendar_update_event"
+    description: str = """
+    Update an existing event in Google Calendar.
+    Use this tool to modify event details like title, time, description.
+    Requires event ID and at least one field to update.
+    """
+    args_schema: type[GoogleCalendarUpdateInput] = GoogleCalendarUpdateInput
+    
+    async def _arun(self, user_id: str, event_id: str, title: str = "", description: str = "", 
+                   start_datetime: str = "", end_datetime: str = "", calendar_id: str = "primary") -> str:
+        """Async implementation of Google Calendar update event."""
+        return await self._update_calendar_event(user_id, event_id, title, description, 
+                                                start_datetime, end_datetime, calendar_id)
+    
+    def _run(self, user_id: str, event_id: str, title: str = "", description: str = "", 
+             start_datetime: str = "", end_datetime: str = "", calendar_id: str = "primary") -> str:
+        """Sync implementation of Google Calendar update event."""
+        return run_async_in_thread(self._update_calendar_event(user_id, event_id, title, description, 
+                                                      start_datetime, end_datetime, calendar_id))
+    
+    async def _update_calendar_event(self, user_id: str, event_id: str, title: str = "", description: str = "", 
+                                   start_datetime: str = "", end_datetime: str = "", calendar_id: str = "primary") -> str:
+        """Update an existing event in Google Calendar"""
+        access_token = await get_google_calendar_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Calendar access token found. Please connect Google Calendar."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # First, get the existing event
+            async with httpx.AsyncClient() as client:
+                get_response = await client.get(
+                    f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers
+                )
+                
+                if get_response.status_code != 200:
+                    return f"Error: Event not found. Status: {get_response.status_code}"
+                
+                existing_event = get_response.json()
+                
+                # Update only the fields that were provided
+                if title:
+                    existing_event["summary"] = title
+                if description:
+                    existing_event["description"] = description
+                if start_datetime:
+                    existing_event["start"]["dateTime"] = start_datetime
+                if end_datetime:
+                    existing_event["end"]["dateTime"] = end_datetime
+                
+                # Update the event
+                update_response = await client.put(
+                    f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers,
+                    json=existing_event
+                )
+                
+                if update_response.status_code == 200:
+                    updated_event = update_response.json()
+                    return f"Successfully updated calendar event '{updated_event.get('summary', title)}' (ID: {event_id})"
+                else:
+                    error_data = update_response.json() if update_response.content else {}
+                    return f"Error: Failed to update calendar event. Status: {update_response.status_code}, Details: {error_data}"
+                
+        except Exception as e:
+            return f"Error updating calendar event: {str(e)}"
+
+class GoogleCalendarDeleteTool(BaseTool):
+    """LangChain tool for deleting Google Calendar events."""
+    
+    name: str = "google_calendar_delete_event"
+    description: str = """
+    Delete an event from Google Calendar.
+    Use this tool to cancel meetings, remove appointments, or clean up calendar.
+    Requires event ID which can be obtained from list_events.
+    """
+    args_schema: type[GoogleCalendarDeleteInput] = GoogleCalendarDeleteInput
+    
+    async def _arun(self, user_id: str, event_id: str, calendar_id: str = "primary") -> str:
+        """Async implementation of Google Calendar delete event."""
+        return await self._delete_calendar_event(user_id, event_id, calendar_id)
+    
+    def _run(self, user_id: str, event_id: str, calendar_id: str = "primary") -> str:
+        """Sync implementation of Google Calendar delete event."""
+        return run_async_in_thread(self._delete_calendar_event(user_id, event_id, calendar_id))
+    
+    async def _delete_calendar_event(self, user_id: str, event_id: str, calendar_id: str = "primary") -> str:
+        """Delete an event from Google Calendar"""
+        access_token = await get_google_calendar_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Calendar access token found. Please connect Google Calendar."
+        
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            # First, get the event details for confirmation
+            async with httpx.AsyncClient() as client:
+                get_response = await client.get(
+                    f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers
+                )
+                
+                if get_response.status_code != 200:
+                    return f"Error: Event not found. Status: {get_response.status_code}"
+                
+                event = get_response.json()
+                event_title = event.get('summary', 'Untitled Event')
+                
+                # Delete the event
+                delete_response = await client.delete(
+                    f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+                    headers=headers
+                )
+                
+                if delete_response.status_code == 204:
+                    return f"Successfully deleted calendar event '{event_title}' (ID: {event_id})"
+                else:
+                    return f"Error: Failed to delete calendar event. Status: {delete_response.status_code}"
+                
+        except Exception as e:
+            return f"Error deleting calendar event: {str(e)}"
+
+# Initialize Google Calendar tools
+google_calendar_list_tool = GoogleCalendarListTool()
+google_calendar_create_tool = GoogleCalendarCreateTool()
+google_calendar_update_tool = GoogleCalendarUpdateTool()
+google_calendar_delete_tool = GoogleCalendarDeleteTool()
+
+
+# =============================================================================
+# GOOGLE DOCS TOOLS
+# =============================================================================
+
+class GoogleDocsListInput(BaseModel):
+    """Input for Google Docs list documents tool."""
+    user_id: str = Field(description="User ID to get Google Docs access for")
+    max_results: int = Field(default=10, description="Maximum number of documents to return")
+    query: str = Field(default="", description="Search query to filter documents")
+
+class GoogleDocsReadInput(BaseModel):
+    """Input for Google Docs read document tool."""
+    user_id: str = Field(description="User ID to read Google Docs for")
+    document_id: str = Field(description="Google Docs document ID")
+
+class GoogleDocsCreateInput(BaseModel):
+    """Input for Google Docs create document tool."""
+    user_id: str = Field(description="User ID to create Google Docs for")
+    title: str = Field(description="Document title")
+    content: str = Field(default="", description="Initial document content")
+
+class GoogleDocsUpdateInput(BaseModel):
+    """Input for Google Docs update document tool."""
+    user_id: str = Field(description="User ID to update Google Docs for")
+    document_id: str = Field(description="Google Docs document ID")
+    content: str = Field(description="New content to append or replace")
+    operation: str = Field(default="append", description="Operation: 'append' or 'replace'")
+
+async def get_google_docs_access_token(user_id: str) -> Optional[str]:
+    """Get valid Google Docs access token for user"""
+    try:
+        result = supabase.table('oauth_integrations').select('*').eq('user_id', user_id).eq('integration_type', 'google_docs').execute()
+        
+        if not result.data:
+            return None
+        
+        token_data = result.data[0]
+        access_token = token_data['access_token']
+        refresh_token = token_data.get('refresh_token')
+        expires_at = token_data.get('token_expires_at')
+        
+        # Check if token is expired and refresh if needed
+        if expires_at:
+            expires_datetime = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            if expires_datetime <= datetime.now(timezone.utc):
+                # Token expired, try to refresh
+                if refresh_token:
+                    new_token = await refresh_google_token(refresh_token, user_id, 'google_docs')
+                    return new_token
+                else:
+                    return None
+        
+        return access_token
+    except Exception as e:
+        print(f"Error getting Google Docs access token: {e}")
+        return None
+
+class GoogleDocsListTool(BaseTool):
+    """LangChain tool for listing Google Docs documents."""
+    
+    name: str = "google_docs_list_documents"
+    description: str = """
+    List Google Docs documents accessible to the user.
+    Use this tool to find documents, see recent files, or search for specific documents.
+    Returns document titles, IDs, and basic metadata.
+    """
+    args_schema: type[GoogleDocsListInput] = GoogleDocsListInput
+    
+    async def _arun(self, user_id: str, max_results: int = 10, query: str = "") -> str:
+        """Async implementation of Google Docs list documents."""
+        return await self._list_documents(user_id, max_results, query)
+    
+    def _run(self, user_id: str, max_results: int = 10, query: str = "") -> str:
+        """Sync implementation of Google Docs list documents."""
+        return run_async_in_thread(self._list_documents(user_id, max_results, query))
+    
+    async def _list_documents(self, user_id: str, max_results: int = 10, query: str = "") -> str:
+        """List Google Docs documents using Drive API"""
+        access_token = await get_google_docs_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Docs access token found. Please connect Google Docs."
+        
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            # Use Google Drive API to find Google Docs
+            params = {
+                "q": f"mimeType='application/vnd.google-apps.document'",
+                "pageSize": max_results,
+                "fields": "files(id,name,modifiedTime,webViewLink)"
+            }
+            
+            # Add search query if provided
+            if query:
+                params["q"] += f" and name contains '{query}'"
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://www.googleapis.com/drive/v3/files",
+                    headers=headers,
+                    params=params
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to fetch documents. Status: {response.status_code}"
+                
+                files_data = response.json()
+                files = files_data.get('files', [])
+                
+                if not files:
+                    return "No Google Docs documents found."
+                
+                result = "Google Docs Documents:\n\n"
+                for i, doc in enumerate(files, 1):
+                    name = doc.get('name', 'Untitled')
+                    doc_id = doc.get('id', '')
+                    modified = doc.get('modifiedTime', '')
+                    link = doc.get('webViewLink', '')
+                    
+                    result += f"{i}. {name}\n"
+                    result += f"   Document ID: {doc_id}\n"
+                    result += f"   Last Modified: {modified}\n"
+                    result += f"   Link: {link}\n\n"
+                
+                return result
+                
+        except Exception as e:
+            return f"Error listing documents: {str(e)}"
+
+class GoogleDocsReadTool(BaseTool):
+    """LangChain tool for reading Google Docs content."""
+    
+    name: str = "google_docs_read_document"
+    description: str = """
+    Read the content of a Google Docs document.
+    Use this tool to extract text content from documents for analysis or processing.
+    Requires document ID which can be obtained from list_documents.
+    """
+    args_schema: type[GoogleDocsReadInput] = GoogleDocsReadInput
+    
+    async def _arun(self, user_id: str, document_id: str) -> str:
+        """Async implementation of Google Docs read document."""
+        return await self._read_document(user_id, document_id)
+    
+    def _run(self, user_id: str, document_id: str) -> str:
+        """Sync implementation of Google Docs read document."""
+        return run_async_in_thread(self._read_document(user_id, document_id))
+    
+    async def _read_document(self, user_id: str, document_id: str) -> str:
+        """Read content from a Google Docs document"""
+        access_token = await get_google_docs_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Docs access token found. Please connect Google Docs."
+        
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://docs.googleapis.com/v1/documents/{document_id}",
+                    headers=headers
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to read document. Status: {response.status_code}"
+                
+                doc_data = response.json()
+                title = doc_data.get('title', 'Untitled Document')
+                
+                # Extract text content from the document structure
+                content = self._extract_text_content(doc_data.get('body', {}).get('content', []))
+                
+                result = f"Document Title: {title}\n"
+                result += f"Document ID: {document_id}\n\n"
+                result += f"Content:\n{content}"
+                
+                return result
+                
+        except Exception as e:
+            return f"Error reading document: {str(e)}"
+    
+    def _extract_text_content(self, content_elements: List[Dict]) -> str:
+        """Extract plain text from Google Docs content structure"""
+        text = ""
+        for element in content_elements:
+            if 'paragraph' in element:
+                paragraph = element['paragraph']
+                for text_run in paragraph.get('elements', []):
+                    if 'textRun' in text_run:
+                        text += text_run['textRun'].get('content', '')
+            elif 'table' in element:
+                # Handle table content
+                table = element['table']
+                for row in table.get('tableRows', []):
+                    for cell in row.get('tableCells', []):
+                        cell_content = self._extract_text_content(cell.get('content', []))
+                        text += cell_content + "\t"
+                    text += "\n"
+        return text
+
+class GoogleDocsCreateTool(BaseTool):
+    """LangChain tool for creating Google Docs documents."""
+    
+    name: str = "google_docs_create_document"
+    description: str = """
+    Create a new Google Docs document.
+    Use this tool to create documents, reports, or notes.
+    Requires title and optionally initial content.
+    """
+    args_schema: type[GoogleDocsCreateInput] = GoogleDocsCreateInput
+    
+    async def _arun(self, user_id: str, title: str, content: str = "") -> str:
+        """Async implementation of Google Docs create document."""
+        return await self._create_document(user_id, title, content)
+    
+    def _run(self, user_id: str, title: str, content: str = "") -> str:
+        """Sync implementation of Google Docs create document."""
+        return run_async_in_thread(self._create_document(user_id, title, content))
+    
+    async def _create_document(self, user_id: str, title: str, content: str = "") -> str:
+        """Create a new Google Docs document"""
+        access_token = await get_google_docs_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Docs access token found. Please connect Google Docs."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Create the document
+            doc_data = {"title": title}
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://docs.googleapis.com/v1/documents",
+                    headers=headers,
+                    json=doc_data
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to create document. Status: {response.status_code}"
+                
+                doc = response.json()
+                document_id = doc.get('documentId')
+                doc_title = doc.get('title', title)
+                
+                # Add initial content if provided
+                if content:
+                    await self._add_content_to_document(document_id, content, access_token)
+                
+                # Get the web link
+                drive_response = await client.get(
+                    f"https://www.googleapis.com/drive/v3/files/{document_id}",
+                    headers=headers,
+                    params={"fields": "webViewLink"}
+                )
+                
+                web_link = ""
+                if drive_response.status_code == 200:
+                    drive_data = drive_response.json()
+                    web_link = drive_data.get('webViewLink', '')
+                
+                result = f"Successfully created Google Docs document '{doc_title}'\n"
+                result += f"Document ID: {document_id}\n"
+                if web_link:
+                    result += f"Link: {web_link}\n"
+                
+                return result
+                
+        except Exception as e:
+            return f"Error creating document: {str(e)}"
+    
+    async def _add_content_to_document(self, document_id: str, content: str, access_token: str):
+        """Add content to a Google Docs document"""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Insert text at the beginning of the document
+        requests = [{
+            "insertText": {
+                "location": {"index": 1},
+                "text": content
+            }
+        }]
+        
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://docs.googleapis.com/v1/documents/{document_id}:batchUpdate",
+                headers=headers,
+                json={"requests": requests}
+            )
+
+class GoogleDocsUpdateTool(BaseTool):
+    """LangChain tool for updating Google Docs content."""
+    
+    name: str = "google_docs_update_document"
+    description: str = """
+    Update content in an existing Google Docs document.
+    Use this tool to add content to documents or replace content.
+    Can append new content or replace all content in the document.
+    """
+    args_schema: type[GoogleDocsUpdateInput] = GoogleDocsUpdateInput
+    
+    async def _arun(self, user_id: str, document_id: str, content: str, operation: str = "append") -> str:
+        """Async implementation of Google Docs update document."""
+        return await self._update_document(user_id, document_id, content, operation)
+    
+    def _run(self, user_id: str, document_id: str, content: str, operation: str = "append") -> str:
+        """Sync implementation of Google Docs update document."""
+        return run_async_in_thread(self._update_document(user_id, document_id, content, operation))
+    
+    async def _update_document(self, user_id: str, document_id: str, content: str, operation: str = "append") -> str:
+        """Update content in a Google Docs document"""
+        access_token = await get_google_docs_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Google Docs access token found. Please connect Google Docs."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                # Get document info to find end index
+                doc_response = await client.get(
+                    f"https://docs.googleapis.com/v1/documents/{document_id}",
+                    headers=headers
+                )
+                
+                if doc_response.status_code != 200:
+                    return f"Error: Failed to access document. Status: {doc_response.status_code}"
+                
+                doc_data = doc_response.json()
+                doc_title = doc_data.get('title', 'Unknown Document')
+                
+                requests = []
+                
+                if operation == "replace":
+                    # Delete all content and insert new content
+                    body = doc_data.get('body', {})
+                    content_elements = body.get('content', [])
+                    
+                    # Find the end index (last element's end index)
+                    end_index = 1
+                    for element in content_elements:
+                        if 'endIndex' in element:
+                            end_index = max(end_index, element['endIndex'])
+                    
+                    # Delete all content except the first character (which is protected)
+                    if end_index > 1:
+                        requests.append({
+                            "deleteContentRange": {
+                                "range": {
+                                    "startIndex": 1,
+                                    "endIndex": end_index - 1
+                                }
+                            }
+                        })
+                    
+                    # Insert new content
+                    requests.append({
+                        "insertText": {
+                            "location": {"index": 1},
+                            "text": content
+                        }
+                    })
+                
+                elif operation == "append":
+                    # Append content at the end
+                    body = doc_data.get('body', {})
+                    content_elements = body.get('content', [])
+                    
+                    # Find the end index
+                    end_index = 1
+                    for element in content_elements:
+                        if 'endIndex' in element:
+                            end_index = max(end_index, element['endIndex'])
+                    
+                    # Insert at the end (before the last character which is protected)
+                    requests.append({
+                        "insertText": {
+                            "location": {"index": end_index - 1},
+                            "text": "\n" + content
+                        }
+                    })
+                
+                # Execute the batch update
+                update_response = await client.post(
+                    f"https://docs.googleapis.com/v1/documents/{document_id}:batchUpdate",
+                    headers=headers,
+                    json={"requests": requests}
+                )
+                
+                if update_response.status_code == 200:
+                    return f"Successfully {operation}ed content to document '{doc_title}' (ID: {document_id})"
+                else:
+                    return f"Error: Failed to update document. Status: {update_response.status_code}"
+                
+        except Exception as e:
+            return f"Error updating document: {str(e)}"
+
+# Initialize Google Docs tools
+google_docs_list_tool = GoogleDocsListTool()
+google_docs_read_tool = GoogleDocsReadTool()
+google_docs_create_tool = GoogleDocsCreateTool()
+google_docs_update_tool = GoogleDocsUpdateTool()
+
+
+# =============================================================================
+# NOTION TOOLS
+# =============================================================================
+
+class NotionSearchInput(BaseModel):
+    """Input for Notion search tool."""
+    user_id: str = Field(description="User ID to get Notion access for")
+    query: str = Field(description="Search query to find pages and databases")
+    max_results: int = Field(default=10, description="Maximum number of results to return")
+
+class NotionPageReadInput(BaseModel):
+    """Input for Notion page read tool."""
+    user_id: str = Field(description="User ID to read Notion pages for")
+    page_id: str = Field(description="Notion page ID")
+
+class NotionPageCreateInput(BaseModel):
+    """Input for Notion page create tool."""
+    user_id: str = Field(description="User ID to create Notion pages for")
+    title: str = Field(description="Page title")
+    content: str = Field(default="", description="Page content (plain text)")
+    parent_id: str = Field(default="", description="Parent page or database ID (optional)")
+
+class NotionPageUpdateInput(BaseModel):
+    """Input for Notion page update tool."""
+    user_id: str = Field(description="User ID to update Notion pages for")
+    page_id: str = Field(description="Notion page ID")
+    title: str = Field(default="", description="New page title (optional)")
+    content: str = Field(default="", description="New content to append (optional)")
+
+class NotionDatabaseQueryInput(BaseModel):
+    """Input for Notion database query tool."""
+    user_id: str = Field(description="User ID to query Notion databases for")
+    database_id: str = Field(description="Notion database ID")
+    filter_query: str = Field(default="", description="Filter criteria (optional)")
+    max_results: int = Field(default=10, description="Maximum number of results to return")
+
+async def get_notion_access_token(user_id: str) -> Optional[str]:
+    """Get valid Notion access token for user"""
+    try:
+        result = supabase.table('oauth_integrations').select('*').eq('user_id', user_id).eq('integration_type', 'notion').execute()
+        
+        if not result.data:
+            return None
+        
+        token_data = result.data[0]
+        access_token = token_data['access_token']
+        
+        # Notion tokens don't expire, so we just return the token
+        return access_token
+    except Exception as e:
+        print(f"Error getting Notion access token: {e}")
+        return None
+
+class NotionSearchTool(BaseTool):
+    """LangChain tool for searching Notion pages and databases."""
+    
+    name: str = "notion_search"
+    description: str = """
+    Search for pages and databases in Notion workspace.
+    Use this tool to find content, locate specific pages, or discover databases.
+    Returns page/database titles, IDs, and URLs.
+    """
+    args_schema: type[NotionSearchInput] = NotionSearchInput
+    
+    async def _arun(self, user_id: str, query: str, max_results: int = 10) -> str:
+        """Async implementation of Notion search."""
+        return await self._search_notion(user_id, query, max_results)
+    
+    def _run(self, user_id: str, query: str, max_results: int = 10) -> str:
+        """Sync implementation of Notion search."""
+        return run_async_in_thread(self._search_notion(user_id, query, max_results))
+    
+    async def _search_notion(self, user_id: str, query: str, max_results: int = 10) -> str:
+        """Search Notion pages and databases"""
+        access_token = await get_notion_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Notion access token found. Please connect Notion."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Notion-Version": "2022-06-28"
+            }
+            
+            search_data = {
+                "query": query,
+                "page_size": max_results
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.notion.com/v1/search",
+                    headers=headers,
+                    json=search_data
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to search Notion. Status: {response.status_code}"
+                
+                search_results = response.json()
+                results = search_results.get('results', [])
+                
+                if not results:
+                    return f"No results found for query: '{query}'"
+                
+                result_text = f"Notion Search Results for '{query}':\n\n"
+                for i, item in enumerate(results, 1):
+                    object_type = item.get('object', 'unknown')
+                    item_id = item.get('id', '')
+                    url = item.get('url', '')
+                    
+                    if object_type == 'page':
+                        title = self._extract_title_from_page(item)
+                        result_text += f"{i}. [PAGE] {title}\n"
+                    elif object_type == 'database':
+                        title = self._extract_title_from_database(item)
+                        result_text += f"{i}. [DATABASE] {title}\n"
+                    
+                    result_text += f"   ID: {item_id}\n"
+                    result_text += f"   URL: {url}\n\n"
+                
+                return result_text
+                
+        except Exception as e:
+            return f"Error searching Notion: {str(e)}"
+    
+    def _extract_title_from_page(self, page: Dict) -> str:
+        """Extract title from Notion page object"""
+        properties = page.get('properties', {})
+        for prop_name, prop_data in properties.items():
+            if prop_data.get('type') == 'title':
+                title_array = prop_data.get('title', [])
+                if title_array:
+                    return title_array[0].get('plain_text', 'Untitled')
+        return 'Untitled Page'
+    
+    def _extract_title_from_database(self, database: Dict) -> str:
+        """Extract title from Notion database object"""
+        title_array = database.get('title', [])
+        if title_array:
+            return title_array[0].get('plain_text', 'Untitled Database')
+        return 'Untitled Database'
+
+class NotionPageReadTool(BaseTool):
+    """LangChain tool for reading Notion pages."""
+    
+    name: str = "notion_read_page"
+    description: str = """
+    Read content from a Notion page.
+    Use this tool to extract text content from pages for analysis or processing.
+    Requires page ID which can be obtained from search results.
+    """
+    args_schema: type[NotionPageReadInput] = NotionPageReadInput
+    
+    async def _arun(self, user_id: str, page_id: str) -> str:
+        """Async implementation of Notion page read."""
+        return await self._read_page(user_id, page_id)
+    
+    def _run(self, user_id: str, page_id: str) -> str:
+        """Sync implementation of Notion page read."""
+        return run_async_in_thread(self._read_page(user_id, page_id))
+    
+    async def _read_page(self, user_id: str, page_id: str) -> str:
+        """Read content from a Notion page"""
+        access_token = await get_notion_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Notion access token found. Please connect Notion."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Notion-Version": "2022-06-28"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                # Get page properties
+                page_response = await client.get(
+                    f"https://api.notion.com/v1/pages/{page_id}",
+                    headers=headers
+                )
+                
+                if page_response.status_code != 200:
+                    return f"Error: Failed to read page. Status: {page_response.status_code}"
+                
+                page_data = page_response.json()
+                title = self._extract_title_from_page(page_data)
+                
+                # Get page content (blocks)
+                blocks_response = await client.get(
+                    f"https://api.notion.com/v1/blocks/{page_id}/children",
+                    headers=headers
+                )
+                
+                if blocks_response.status_code != 200:
+                    return f"Error: Failed to read page content. Status: {blocks_response.status_code}"
+                
+                blocks_data = blocks_response.json()
+                blocks = blocks_data.get('results', [])
+                
+                content = self._extract_text_from_blocks(blocks)
+                
+                result = f"Notion Page: {title}\n"
+                result += f"Page ID: {page_id}\n"
+                result += f"URL: {page_data.get('url', '')}\n\n"
+                result += f"Content:\n{content}"
+                
+                return result
+                
+        except Exception as e:
+            return f"Error reading Notion page: {str(e)}"
+    
+    def _extract_text_from_blocks(self, blocks: List[Dict]) -> str:
+        """Extract plain text from Notion blocks"""
+        text = ""
+        for block in blocks:
+            block_type = block.get('type', '')
+            
+            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3', 'bulleted_list_item', 'numbered_list_item']:
+                block_data = block.get(block_type, {})
+                rich_text = block_data.get('rich_text', [])
+                for text_item in rich_text:
+                    text += text_item.get('plain_text', '')
+                text += "\n"
+            elif block_type == 'to_do':
+                todo_data = block.get('to_do', {})
+                checked = todo_data.get('checked', False)
+                status = "☑" if checked else "☐"
+                rich_text = todo_data.get('rich_text', [])
+                todo_text = ''.join([item.get('plain_text', '') for item in rich_text])
+                text += f"{status} {todo_text}\n"
+        
+        return text
+
+class NotionPageCreateTool(BaseTool):
+    """LangChain tool for creating Notion pages."""
+    
+    name: str = "notion_create_page"
+    description: str = """
+    Create a new page in Notion workspace.
+    Use this tool to create notes, documents, or task pages.
+    Requires title and optionally content and parent page/database ID.
+    """
+    args_schema: type[NotionPageCreateInput] = NotionPageCreateInput
+    
+    async def _arun(self, user_id: str, title: str, content: str = "", parent_id: str = "") -> str:
+        """Async implementation of Notion page create."""
+        return await self._create_page(user_id, title, content, parent_id)
+    
+    def _run(self, user_id: str, title: str, content: str = "", parent_id: str = "") -> str:
+        """Sync implementation of Notion page create."""
+        return run_async_in_thread(self._create_page(user_id, title, content, parent_id))
+    
+    async def _create_page(self, user_id: str, title: str, content: str = "", parent_id: str = "") -> str:
+        """Create a new page in Notion"""
+        access_token = await get_notion_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Notion access token found. Please connect Notion."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Notion-Version": "2022-06-28"
+            }
+            
+            # Build page data
+            page_data = {
+                "properties": {
+                    "title": {
+                        "title": [
+                            {
+                                "text": {
+                                    "content": title
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+            
+            # Set parent (workspace if no parent_id provided)
+            if parent_id:
+                page_data["parent"] = {"page_id": parent_id}
+            else:
+                # Get workspace info to set as parent
+                workspace_result = supabase.table('oauth_integrations').select('metadata').eq('user_id', user_id).eq('integration_type', 'notion').execute()
+                if workspace_result.data:
+                    workspace_id = workspace_result.data[0].get('metadata', {}).get('workspace_id')
+                    if workspace_id:
+                        page_data["parent"] = {"workspace": True}
+            
+            # Add content if provided
+            if content:
+                page_data["children"] = [
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {
+                                        "content": content
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.notion.com/v1/pages",
+                    headers=headers,
+                    json=page_data
+                )
+                
+                if response.status_code == 200:
+                    page = response.json()
+                    page_id = page.get('id', '')
+                    page_url = page.get('url', '')
+                    return f"Successfully created Notion page '{title}' (ID: {page_id}). View at: {page_url}"
+                else:
+                    error_data = response.json() if response.content else {}
+                    return f"Error: Failed to create page. Status: {response.status_code}, Details: {error_data}"
+                
+        except Exception as e:
+            return f"Error creating Notion page: {str(e)}"
+
+class NotionPageUpdateTool(BaseTool):
+    """LangChain tool for updating Notion pages."""
+    
+    name: str = "notion_update_page"
+    description: str = """
+    Update an existing Notion page.
+    Use this tool to modify page title or append content to pages.
+    Requires page ID and at least title or content to update.
+    """
+    args_schema: type[NotionPageUpdateInput] = NotionPageUpdateInput
+    
+    async def _arun(self, user_id: str, page_id: str, title: str = "", content: str = "") -> str:
+        """Async implementation of Notion page update."""
+        return await self._update_page(user_id, page_id, title, content)
+    
+    def _run(self, user_id: str, page_id: str, title: str = "", content: str = "") -> str:
+        """Sync implementation of Notion page update."""
+        return run_async_in_thread(self._update_page(user_id, page_id, title, content))
+    
+    async def _update_page(self, user_id: str, page_id: str, title: str = "", content: str = "") -> str:
+        """Update an existing Notion page"""
+        access_token = await get_notion_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Notion access token found. Please connect Notion."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Notion-Version": "2022-06-28"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                # Update title if provided
+                if title:
+                    title_data = {
+                        "properties": {
+                            "title": {
+                                "title": [
+                                    {
+                                        "text": {
+                                            "content": title
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                    
+                    title_response = await client.patch(
+                        f"https://api.notion.com/v1/pages/{page_id}",
+                        headers=headers,
+                        json=title_data
+                    )
+                    
+                    if title_response.status_code != 200:
+                        return f"Error: Failed to update page title. Status: {title_response.status_code}"
+                
+                # Add content if provided
+                if content:
+                    content_data = {
+                        "children": [
+                            {
+                                "object": "block",
+                                "type": "paragraph",
+                                "paragraph": {
+                                    "rich_text": [
+                                        {
+                                            "type": "text",
+                                            "text": {
+                                                "content": content
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                    
+                    content_response = await client.patch(
+                        f"https://api.notion.com/v1/blocks/{page_id}/children",
+                        headers=headers,
+                        json=content_data
+                    )
+                    
+                    if content_response.status_code != 200:
+                        return f"Error: Failed to add content to page. Status: {content_response.status_code}"
+                
+                return f"Successfully updated Notion page (ID: {page_id})"
+                
+        except Exception as e:
+            return f"Error updating Notion page: {str(e)}"
+
+class NotionDatabaseQueryTool(BaseTool):
+    """LangChain tool for querying Notion databases."""
+    
+    name: str = "notion_query_database"
+    description: str = """
+    Query entries from a Notion database.
+    Use this tool to retrieve data from databases, tables, or structured content.
+    Requires database ID which can be obtained from search results.
+    """
+    args_schema: type[NotionDatabaseQueryInput] = NotionDatabaseQueryInput
+    
+    async def _arun(self, user_id: str, database_id: str, filter_query: str = "", max_results: int = 10) -> str:
+        """Async implementation of Notion database query."""
+        return await self._query_database(user_id, database_id, filter_query, max_results)
+    
+    def _run(self, user_id: str, database_id: str, filter_query: str = "", max_results: int = 10) -> str:
+        """Sync implementation of Notion database query."""
+        return run_async_in_thread(self._query_database(user_id, database_id, filter_query, max_results))
+    
+    async def _query_database(self, user_id: str, database_id: str, filter_query: str = "", max_results: int = 10) -> str:
+        """Query entries from a Notion database"""
+        access_token = await get_notion_access_token(user_id)
+        if not access_token:
+            return "Error: No valid Notion access token found. Please connect Notion."
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Notion-Version": "2022-06-28"
+            }
+            
+            query_data = {
+                "page_size": max_results
+            }
+            
+            # Add basic text filter if provided
+            if filter_query:
+                query_data["filter"] = {
+                    "property": "title",
+                    "rich_text": {
+                        "contains": filter_query
+                    }
+                }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"https://api.notion.com/v1/databases/{database_id}/query",
+                    headers=headers,
+                    json=query_data
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to query database. Status: {response.status_code}"
+                
+                query_results = response.json()
+                results = query_results.get('results', [])
+                
+                if not results:
+                    return "No entries found in the database."
+                
+                result_text = f"Database Query Results:\n\n"
+                for i, entry in enumerate(results, 1):
+                    entry_id = entry.get('id', '')
+                    properties = entry.get('properties', {})
+                    
+                    result_text += f"{i}. Entry ID: {entry_id}\n"
+                    
+                    # Extract property values
+                    for prop_name, prop_data in properties.items():
+                        prop_type = prop_data.get('type', '')
+                        value = self._extract_property_value(prop_data, prop_type)
+                        result_text += f"   {prop_name}: {value}\n"
+                    
+                    result_text += "\n"
+                
+                return result_text
+                
+        except Exception as e:
+            return f"Error querying Notion database: {str(e)}"
+    
+    def _extract_property_value(self, prop_data: Dict, prop_type: str) -> str:
+        """Extract value from Notion property based on type"""
+        if prop_type == 'title':
+            title_array = prop_data.get('title', [])
+            return ''.join([item.get('plain_text', '') for item in title_array])
+        elif prop_type == 'rich_text':
+            text_array = prop_data.get('rich_text', [])
+            return ''.join([item.get('plain_text', '') for item in text_array])
+        elif prop_type == 'number':
+            return str(prop_data.get('number', ''))
+        elif prop_type == 'select':
+            select_data = prop_data.get('select', {})
+            return select_data.get('name', '')
+        elif prop_type == 'date':
+            date_data = prop_data.get('date', {})
+            return date_data.get('start', '')
+        elif prop_type == 'checkbox':
+            return str(prop_data.get('checkbox', False))
+        else:
+            return str(prop_data.get(prop_type, ''))
+
+# Initialize Notion tools
+notion_search_tool = NotionSearchTool()
+notion_page_read_tool = NotionPageReadTool()
+notion_page_create_tool = NotionPageCreateTool()
+notion_page_update_tool = NotionPageUpdateTool()
+notion_database_query_tool = NotionDatabaseQueryTool()
+
+
+# =============================================================================
+# GITHUB TOOLS
+# =============================================================================
+
+class GitHubRepoListInput(BaseModel):
+    """Input for GitHub repository list tool."""
+    user_id: str = Field(description="User ID to get GitHub access for")
+    max_results: int = Field(default=10, description="Maximum number of repositories to return")
+
+class GitHubRepoInfoInput(BaseModel):
+    """Input for GitHub repository info tool."""
+    user_id: str = Field(description="User ID to get GitHub access for")
+    repo_name: str = Field(description="Repository name in format 'owner/repo'")
+
+class GitHubIssueListInput(BaseModel):
+    """Input for GitHub issues list tool."""
+    user_id: str = Field(description="User ID to get GitHub access for")
+    repo_name: str = Field(description="Repository name in format 'owner/repo'")
+    state: str = Field(default="open", description="Issue state: open, closed, or all")
+    max_results: int = Field(default=10, description="Maximum number of issues to return")
+
+class GitHubIssueCreateInput(BaseModel):
+    """Input for GitHub issue create tool."""
+    user_id: str = Field(description="User ID to get GitHub access for")
+    repo_name: str = Field(description="Repository name in format 'owner/repo'")
+    title: str = Field(description="Issue title")
+    body: str = Field(default="", description="Issue body/description")
+    labels: str = Field(default="", description="Comma-separated list of labels")
+
+class GitHubFileReadInput(BaseModel):
+    """Input for GitHub file read tool."""
+    user_id: str = Field(description="User ID to get GitHub access for")
+    repo_name: str = Field(description="Repository name in format 'owner/repo'")
+    file_path: str = Field(description="Path to file in repository")
+    branch: str = Field(default="main", description="Branch name (default: main)")
+
+async def get_github_access_token(user_id: str) -> Optional[str]:
+    """Get valid GitHub access token for user"""
+    try:
+        result = supabase.table('oauth_integrations').select('*').eq('user_id', user_id).eq('integration_type', 'github').execute()
+        
+        if not result.data:
+            return None
+        
+        token_data = result.data[0]
+        access_token = token_data['access_token']
+        
+        # GitHub tokens don't expire, so we just return the token
+        return access_token
+    except Exception as e:
+        print(f"Error getting GitHub access token: {e}")
+        return None
+
+class GitHubRepoListTool(BaseTool):
+    """LangChain tool for listing GitHub repositories."""
+    
+    name: str = "github_list_repos"
+    description: str = """
+    List user's GitHub repositories.
+    Use this tool to discover available repositories for the user.
+    Returns repository names, descriptions, languages, and URLs.
+    """
+    args_schema: type[GitHubRepoListInput] = GitHubRepoListInput
+    
+    async def _arun(self, user_id: str, max_results: int = 10) -> str:
+        """Async implementation of GitHub repo list."""
+        return await self._list_repos(user_id, max_results)
+    
+    def _run(self, user_id: str, max_results: int = 10) -> str:
+        """Sync implementation of GitHub repo list."""
+        return run_async_in_thread(self._list_repos(user_id, max_results))
+    
+    async def _list_repos(self, user_id: str, max_results: int = 10) -> str:
+        """List user's GitHub repositories"""
+        access_token = await get_github_access_token(user_id)
+        if not access_token:
+            return "Error: No valid GitHub access token found. Please connect GitHub."
+        
+        try:
+            headers = {
+                "Authorization": f"token {access_token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://api.github.com/user/repos?sort=updated&per_page={max_results}",
+                    headers=headers
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to fetch repositories. Status: {response.status_code}"
+                
+                repos = response.json()
+                
+                if not repos:
+                    return "No repositories found."
+                
+                result_text = "Your GitHub Repositories:\n\n"
+                for i, repo in enumerate(repos, 1):
+                    name = repo.get('full_name', '')
+                    description = repo.get('description', 'No description')
+                    language = repo.get('language', 'Unknown')
+                    stars = repo.get('stargazers_count', 0)
+                    url = repo.get('html_url', '')
+                    updated = repo.get('updated_at', '')
+                    
+                    result_text += f"{i}. {name}\n"
+                    result_text += f"   Description: {description}\n"
+                    result_text += f"   Language: {language}\n"
+                    result_text += f"   Stars: {stars}\n"
+                    result_text += f"   Updated: {updated}\n"
+                    result_text += f"   URL: {url}\n\n"
+                
+                return result_text
+                
+        except Exception as e:
+            return f"Error listing GitHub repositories: {str(e)}"
+
+class GitHubRepoInfoTool(BaseTool):
+    """LangChain tool for getting GitHub repository information."""
+    
+    name: str = "github_repo_info"
+    description: str = """
+    Get detailed information about a specific GitHub repository.
+    Use this tool to learn about repository structure, README, and metadata.
+    Requires repository name in format 'owner/repo'.
+    """
+    args_schema: type[GitHubRepoInfoInput] = GitHubRepoInfoInput
+    
+    async def _arun(self, user_id: str, repo_name: str) -> str:
+        """Async implementation of GitHub repo info."""
+        return await self._get_repo_info(user_id, repo_name)
+    
+    def _run(self, user_id: str, repo_name: str) -> str:
+        """Sync implementation of GitHub repo info."""
+        return run_async_in_thread(self._get_repo_info(user_id, repo_name))
+    
+    async def _get_repo_info(self, user_id: str, repo_name: str) -> str:
+        """Get detailed repository information"""
+        access_token = await get_github_access_token(user_id)
+        if not access_token:
+            return "Error: No valid GitHub access token found. Please connect GitHub."
+        
+        try:
+            headers = {
+                "Authorization": f"token {access_token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                # Get repository info
+                repo_response = await client.get(
+                    f"https://api.github.com/repos/{repo_name}",
+                    headers=headers
+                )
+                
+                if repo_response.status_code != 200:
+                    return f"Error: Failed to get repository info. Status: {repo_response.status_code}"
+                
+                repo = repo_response.json()
+                
+                # Get README content
+                readme_response = await client.get(
+                    f"https://api.github.com/repos/{repo_name}/readme",
+                    headers=headers
+                )
+                
+                readme_content = ""
+                if readme_response.status_code == 200:
+                    readme_data = readme_response.json()
+                    # Decode base64 content
+                    import base64
+                    readme_content = base64.b64decode(readme_data['content']).decode('utf-8')
+                
+                # Format response
+                result_text = f"Repository: {repo.get('full_name', '')}\n\n"
+                result_text += f"Description: {repo.get('description', 'No description')}\n"
+                result_text += f"Language: {repo.get('language', 'Unknown')}\n"
+                result_text += f"Stars: {repo.get('stargazers_count', 0)}\n"
+                result_text += f"Forks: {repo.get('forks_count', 0)}\n"
+                result_text += f"Open Issues: {repo.get('open_issues_count', 0)}\n"
+                result_text += f"Default Branch: {repo.get('default_branch', 'main')}\n"
+                result_text += f"Created: {repo.get('created_at', '')}\n"
+                result_text += f"Updated: {repo.get('updated_at', '')}\n"
+                result_text += f"URL: {repo.get('html_url', '')}\n"
+                result_text += f"Clone URL: {repo.get('clone_url', '')}\n\n"
+                
+                if readme_content:
+                    result_text += "README.md:\n"
+                    result_text += "=" * 50 + "\n"
+                    result_text += readme_content[:2000]  # Limit README length
+                    if len(readme_content) > 2000:
+                        result_text += "\n... (truncated)"
+                
+                return result_text
+                
+        except Exception as e:
+            return f"Error getting GitHub repository info: {str(e)}"
+
+class GitHubIssueListTool(BaseTool):
+    """LangChain tool for listing GitHub issues."""
+    
+    name: str = "github_list_issues"
+    description: str = """
+    List issues from a GitHub repository.
+    Use this tool to track bugs, feature requests, and project tasks.
+    Can filter by state (open, closed, all).
+    """
+    args_schema: type[GitHubIssueListInput] = GitHubIssueListInput
+    
+    async def _arun(self, user_id: str, repo_name: str, state: str = "open", max_results: int = 10) -> str:
+        """Async implementation of GitHub issue list."""
+        return await self._list_issues(user_id, repo_name, state, max_results)
+    
+    def _run(self, user_id: str, repo_name: str, state: str = "open", max_results: int = 10) -> str:
+        """Sync implementation of GitHub issue list."""
+        return run_async_in_thread(self._list_issues(user_id, repo_name, state, max_results))
+    
+    async def _list_issues(self, user_id: str, repo_name: str, state: str = "open", max_results: int = 10) -> str:
+        """List issues from a GitHub repository"""
+        access_token = await get_github_access_token(user_id)
+        if not access_token:
+            return "Error: No valid GitHub access token found. Please connect GitHub."
+        
+        try:
+            headers = {
+                "Authorization": f"token {access_token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://api.github.com/repos/{repo_name}/issues?state={state}&per_page={max_results}",
+                    headers=headers
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to fetch issues. Status: {response.status_code}"
+                
+                issues = response.json()
+                
+                if not issues:
+                    return f"No {state} issues found in {repo_name}."
+                
+                result_text = f"GitHub Issues ({state}) for {repo_name}:\n\n"
+                for i, issue in enumerate(issues, 1):
+                    number = issue.get('number', '')
+                    title = issue.get('title', '')
+                    author = issue.get('user', {}).get('login', 'Unknown')
+                    created = issue.get('created_at', '')
+                    labels = [label.get('name', '') for label in issue.get('labels', [])]
+                    url = issue.get('html_url', '')
+                    
+                    result_text += f"{i}. #{number}: {title}\n"
+                    result_text += f"   Author: {author}\n"
+                    result_text += f"   Created: {created}\n"
+                    if labels:
+                        result_text += f"   Labels: {', '.join(labels)}\n"
+                    result_text += f"   URL: {url}\n\n"
+                
+                return result_text
+                
+        except Exception as e:
+            return f"Error listing GitHub issues: {str(e)}"
+
+class GitHubIssueCreateTool(BaseTool):
+    """LangChain tool for creating GitHub issues."""
+    
+    name: str = "github_create_issue"
+    description: str = """
+    Create a new issue in a GitHub repository.
+    Use this tool to report bugs, request features, or create tasks.
+    Requires title and optionally body and labels.
+    """
+    args_schema: type[GitHubIssueCreateInput] = GitHubIssueCreateInput
+    
+    async def _arun(self, user_id: str, repo_name: str, title: str, body: str = "", labels: str = "") -> str:
+        """Async implementation of GitHub issue create."""
+        return await self._create_issue(user_id, repo_name, title, body, labels)
+    
+    def _run(self, user_id: str, repo_name: str, title: str, body: str = "", labels: str = "") -> str:
+        """Sync implementation of GitHub issue create."""
+        return run_async_in_thread(self._create_issue(user_id, repo_name, title, body, labels))
+    
+    async def _create_issue(self, user_id: str, repo_name: str, title: str, body: str = "", labels: str = "") -> str:
+        """Create a new issue in GitHub repository"""
+        access_token = await get_github_access_token(user_id)
+        if not access_token:
+            return "Error: No valid GitHub access token found. Please connect GitHub."
+        
+        try:
+            headers = {
+                "Authorization": f"token {access_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json"
+            }
+            
+            issue_data = {
+                "title": title,
+                "body": body
+            }
+            
+            if labels:
+                label_list = [label.strip() for label in labels.split(',') if label.strip()]
+                issue_data["labels"] = label_list
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"https://api.github.com/repos/{repo_name}/issues",
+                    headers=headers,
+                    json=issue_data
+                )
+                
+                if response.status_code == 201:
+                    issue = response.json()
+                    number = issue.get('number', '')
+                    url = issue.get('html_url', '')
+                    return f"Successfully created issue #{number}: '{title}' in {repo_name}. View at: {url}"
+                else:
+                    error_data = response.json() if response.content else {}
+                    return f"Error: Failed to create issue. Status: {response.status_code}, Details: {error_data}"
+                
+        except Exception as e:
+            return f"Error creating GitHub issue: {str(e)}"
+
+class GitHubFileReadTool(BaseTool):
+    """LangChain tool for reading GitHub files."""
+    
+    name: str = "github_read_file"
+    description: str = """
+    Read content from a file in a GitHub repository.
+    Use this tool to examine source code, documentation, or any text files.
+    Requires repository name and file path.
+    """
+    args_schema: type[GitHubFileReadInput] = GitHubFileReadInput
+    
+    async def _arun(self, user_id: str, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """Async implementation of GitHub file read."""
+        return await self._read_file(user_id, repo_name, file_path, branch)
+    
+    def _run(self, user_id: str, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """Sync implementation of GitHub file read."""
+        return run_async_in_thread(self._read_file(user_id, repo_name, file_path, branch))
+    
+    async def _read_file(self, user_id: str, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """Read content from a file in GitHub repository"""
+        access_token = await get_github_access_token(user_id)
+        if not access_token:
+            return "Error: No valid GitHub access token found. Please connect GitHub."
+        
+        try:
+            headers = {
+                "Authorization": f"token {access_token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://api.github.com/repos/{repo_name}/contents/{file_path}?ref={branch}",
+                    headers=headers
+                )
+                
+                if response.status_code != 200:
+                    return f"Error: Failed to read file. Status: {response.status_code}"
+                
+                file_data = response.json()
+                
+                # Decode base64 content
+                import base64
+                content = base64.b64decode(file_data['content']).decode('utf-8')
+                
+                file_size = file_data.get('size', 0)
+                download_url = file_data.get('download_url', '')
+                
+                result_text = f"File: {repo_name}/{file_path} (branch: {branch})\n"
+                result_text += f"Size: {file_size} bytes\n"
+                result_text += f"Download URL: {download_url}\n\n"
+                result_text += "Content:\n"
+                result_text += "=" * 50 + "\n"
+                result_text += content
+                
+                return result_text
+                
+        except Exception as e:
+            return f"Error reading GitHub file: {str(e)}"
+
+# Initialize GitHub tools
+github_repo_list_tool = GitHubRepoListTool()
+github_repo_info_tool = GitHubRepoInfoTool()
+github_issue_list_tool = GitHubIssueListTool()
+github_issue_create_tool = GitHubIssueCreateTool()
+github_file_read_tool = GitHubFileReadTool()
+
+
 # Export tools for use in other modules
 __all__ = [
     'tavily_tool', 'gemini_tool', 'gmail_read_tool', 'gmail_send_tool', 'gmail_search_tool', 'gmail_delete_tool',
-    'TavilySearchTool', 'GeminiLLMTool', 'GmailReadTool', 'GmailSendTool', 'GmailSearchTool', 'GmailDeleteTool'
+    'google_calendar_list_tool', 'google_calendar_create_tool', 'google_calendar_update_tool', 'google_calendar_delete_tool',
+    'google_docs_list_tool', 'google_docs_read_tool', 'google_docs_create_tool', 'google_docs_update_tool',
+    'notion_search_tool', 'notion_page_read_tool', 'notion_page_create_tool', 'notion_page_update_tool', 'notion_database_query_tool',
+    'github_repo_list_tool', 'github_repo_info_tool', 'github_issue_list_tool', 'github_issue_create_tool', 'github_file_read_tool',
+    'TavilySearchTool', 'GeminiLLMTool', 'GmailReadTool', 'GmailSendTool', 'GmailSearchTool', 'GmailDeleteTool',
+    'GoogleCalendarListTool', 'GoogleCalendarCreateTool', 'GoogleCalendarUpdateTool', 'GoogleCalendarDeleteTool',
+    'GoogleDocsListTool', 'GoogleDocsReadTool', 'GoogleDocsCreateTool', 'GoogleDocsUpdateTool',
+    'NotionSearchTool', 'NotionPageReadTool', 'NotionPageCreateTool', 'NotionPageUpdateTool', 'NotionDatabaseQueryTool',
+    'GitHubRepoListTool', 'GitHubRepoInfoTool', 'GitHubIssueListTool', 'GitHubIssueCreateTool', 'GitHubFileReadTool'
 ]

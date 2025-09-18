@@ -5,14 +5,37 @@ This module defines specialized agents for research, analysis, and writing tasks
 
 import os
 import asyncio
+import re
+from typing import List, Optional
+from threading import local
 
 import httpx
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import tool
 from dotenv import load_dotenv
 
+# Import LangChain tools
+from langchain_tools import (
+    tavily_tool, gemini_tool, gmail_read_tool, gmail_send_tool, gmail_search_tool, gmail_delete_tool,
+    google_calendar_list_tool, google_calendar_create_tool, google_calendar_update_tool, google_calendar_delete_tool,
+    google_docs_list_tool, google_docs_read_tool, google_docs_create_tool, google_docs_update_tool,
+    notion_search_tool, notion_page_read_tool, notion_page_create_tool, notion_page_update_tool, notion_database_query_tool,
+    github_repo_list_tool, github_repo_info_tool, github_issue_list_tool, github_issue_create_tool, github_file_read_tool
+)
+
 # Load environment variables
 load_dotenv()
+
+# Thread-local storage for user context
+_user_context = local()
+
+def set_user_context(user_id: str):
+    """Set the current user context for tools"""
+    _user_context.user_id = user_id
+
+def get_current_user_id() -> str:
+    """Get the current user ID from context"""
+    return getattr(_user_context, 'user_id', 'user')
 
 
 def get_llm():
@@ -81,35 +104,105 @@ def search_web(query: str) -> str:
 
 
 @tool
-def read_gmail_emails(user_id: str, max_results: int = 10, query: str = "") -> str:
+def read_gmail_emails(max_results: int = 10, query: str = "") -> str:
     """Read emails from Gmail inbox. Use this to check recent emails or search for specific messages."""
+    user_id = get_current_user_id()
     from langchain_tools import GmailReadTool
     tool_instance = GmailReadTool()
     return tool_instance._run(user_id, max_results, query)
 
 
 @tool  
-def send_gmail_email(user_id: str, to_email: str, subject: str, body: str) -> str:
+def send_gmail_email(to_email: str, subject: str, body: str) -> str:
     """Send an email through Gmail. Use this to compose and send emails on behalf of the user."""
+    user_id = get_current_user_id()
     from langchain_tools import GmailSendTool
     tool_instance = GmailSendTool()
     return tool_instance._run(user_id, to_email, subject, body)
 
 
 @tool
-def search_gmail_emails(user_id: str, query: str, max_results: int = 20) -> str:
+def search_gmail_emails(query: str, max_results: int = 20) -> str:
     """Search Gmail emails with advanced queries. Supports Gmail search operators like from:, subject:, has:attachment, etc."""
+    user_id = get_current_user_id()
     from langchain_tools import GmailSearchTool
     tool_instance = GmailSearchTool()
     return tool_instance._run(user_id, query, max_results)
 
 
 @tool
-def delete_gmail_emails(user_id: str, query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
+def delete_gmail_emails(query: str, max_results: int = 10, confirm_delete: bool = False) -> str:
     """Delete Gmail emails based on search criteria. IMPORTANT: This permanently deletes emails! Use with extreme caution and always ask for user confirmation first."""
+    user_id = get_current_user_id()
     from langchain_tools import GmailDeleteTool
     tool_instance = GmailDeleteTool()
     return tool_instance._run(user_id, query, max_results, confirm_delete)
+
+
+@tool
+def list_google_calendar_events(max_results: int = 10) -> str:
+    """List upcoming Google Calendar events for the user."""
+    user_id = get_current_user_id()
+    return google_calendar_list_tool._run(user_id, max_results)
+
+@tool
+def create_google_calendar_event(title: str, start_time: str, end_time: str, description: str = "") -> str:
+    """Create a new Google Calendar event."""
+    user_id = get_current_user_id()
+    return google_calendar_create_tool._run(user_id, title, start_time, end_time, description)
+
+@tool
+def list_google_docs(max_results: int = 10) -> str:
+    """List Google Docs for the user."""
+    user_id = get_current_user_id()
+    return google_docs_list_tool._run(user_id, max_results)
+
+@tool
+def read_google_doc(document_id: str) -> str:
+    """Read content from a Google Doc."""
+    user_id = get_current_user_id()
+    return google_docs_read_tool._run(user_id, document_id)
+
+@tool
+def create_google_doc(title: str, content: str = "") -> str:
+    """Create a new Google Doc."""
+    user_id = get_current_user_id()
+    return google_docs_create_tool._run(user_id, title, content)
+
+@tool
+def search_notion(user_id: str, query: str, max_results: int = 10) -> str:
+    """Search for pages and databases in Notion workspace."""
+    return notion_search_tool._run(user_id, query, max_results)
+
+@tool
+def read_notion_page(user_id: str, page_id: str) -> str:
+    """Read content from a Notion page."""
+    return notion_page_read_tool._run(user_id, page_id)
+
+@tool
+def create_notion_page(user_id: str, title: str, content: str = "", parent_id: str = "") -> str:
+    """Create a new page in Notion workspace."""
+    return notion_page_create_tool._run(user_id, title, content, parent_id)
+
+@tool
+def list_github_repos(user_id: str, max_results: int = 10) -> str:
+    """List user's GitHub repositories."""
+    return github_repo_list_tool._run(user_id, max_results)
+
+@tool
+def get_github_repo_info(user_id: str, repo_name: str) -> str:
+    """Get detailed information about a GitHub repository."""
+    return github_repo_info_tool._run(user_id, repo_name)
+
+@tool
+def list_github_issues(user_id: str, repo_name: str, state: str = "open", max_results: int = 10) -> str:
+    """List issues from a GitHub repository."""
+    return github_issue_list_tool._run(user_id, repo_name, state, max_results)
+
+@tool
+def create_github_issue(user_id: str, repo_name: str, title: str, body: str = "", labels: str = "") -> str:
+    """Create a new issue in a GitHub repository."""
+    return github_issue_create_tool._run(user_id, repo_name, title, body, labels)
 
 
 def get_agents():
@@ -170,12 +263,632 @@ def get_agents():
         verbose=True,
         allow_delegation=False
     )
+
+    # Define the Google Calendar Agent
+    google_calendar_agent = Agent(
+        role="Google Calendar Assistant",
+        goal="""You are a specialized Google Calendar assistant who manages schedules, events, and appointments.
+        Your role is to help users organize their time and manage their calendar efficiently.""",
+        backstory="""You are an expert scheduling assistant with deep understanding of time management and calendar organization.
+        You can create events, check availability, reschedule meetings, and provide intelligent scheduling suggestions.
+        You understand time zones, recurring events, and can help users optimize their schedules for productivity.""",
+        tools=[list_google_calendar_events, create_google_calendar_event],
+        llm=llm,
+        verbose=True,
+        allow_delegation=False
+    )
+
+    # Define the Google Docs Agent
+    google_docs_agent = Agent(
+        role="Google Docs Assistant", 
+        goal="""You are a specialized Google Docs assistant who helps create, edit, and manage documents.
+        Your role is to help users with document creation, editing, and organization.""",
+        backstory="""You are an expert document assistant with deep understanding of content creation and document management.
+        You can create well-structured documents, edit existing content, and help organize information effectively.
+        You understand document formatting, collaboration features, and can assist with various document types.""",
+        tools=[list_google_docs, read_google_doc, create_google_doc],
+        llm=llm,
+        verbose=True,
+        allow_delegation=False
+    )
+
+    # Define the Notion Agent
+    notion_agent = Agent(
+        role="Notion Assistant",
+        goal="""You are a specialized Notion assistant who helps organize knowledge and manage workspaces.
+        Your role is to help users create, organize, and find information in their Notion workspace.""",
+        backstory="""You are an expert knowledge management assistant with deep understanding of information architecture.
+        You can create pages, organize databases, search content, and help structure information effectively.
+        You understand Notion's features like databases, templates, and can help users build comprehensive knowledge systems.""",
+        tools=[search_notion, read_notion_page, create_notion_page],
+        llm=llm,
+        verbose=True,
+        allow_delegation=False
+    )
+
+    # Define the GitHub Agent
+    github_agent = Agent(
+        role="GitHub Assistant",
+        goal="""You are a specialized GitHub assistant who helps with repository management and development workflows.
+        Your role is to help users manage repositories, track issues, and understand their development projects.""",
+        backstory="""You are an expert development assistant with deep understanding of version control and project management.
+        You can browse repositories, create issues, analyze code, and help with development workflows.
+        You understand Git concepts, GitHub features, and can assist with collaborative development processes.""",
+        tools=[list_github_repos, get_github_repo_info, list_github_issues, create_github_issue],
+        llm=llm,
+        verbose=True,
+        allow_delegation=False
+    )
     
-    return research_agent, analysis_agent, writer_agent, gmail_agent
+    return research_agent, analysis_agent, writer_agent, gmail_agent, google_calendar_agent, google_docs_agent, notion_agent, github_agent
 
 
 # Legacy agent definitions (kept for compatibility)
-research_agent, analysis_agent, writer_agent, gmail_agent = get_agents()
+research_agent, analysis_agent, writer_agent, gmail_agent, google_calendar_agent, google_docs_agent, notion_agent, github_agent = get_agents()
+
+
+def get_agent_for_integration(integration_type: str):
+    """Get the appropriate agent for a specific integration type."""
+    agents = get_agents()
+    agent_map = {
+        'gmail': agents[3],  # gmail_agent
+        'google_calendar': agents[4],  # google_calendar_agent
+        'google_docs': agents[5],  # google_docs_agent
+        'notion': agents[6],  # notion_agent
+        'github': agents[7],  # github_agent
+    }
+    return agent_map.get(integration_type)
+def get_available_tools_for_user(user_id: str) -> list:
+    """Get available tools based on user's connected integrations."""
+    from main import supabase
+    
+    try:
+        # Get user's connected integrations
+        result = supabase.table('oauth_integrations').select('integration_type').eq('user_id', user_id).execute()
+        connected_integrations = [row['integration_type'] for row in result.data]
+        
+        available_tools = []
+        
+        # Always available tools
+        available_tools.extend([search_web])
+        
+        # Integration-specific tools
+        if 'gmail' in connected_integrations:
+            available_tools.extend([read_gmail_emails, send_gmail_email, search_gmail_emails, delete_gmail_emails])
+            
+        if 'google_calendar' in connected_integrations:
+            available_tools.extend([list_google_calendar_events, create_google_calendar_event])
+            
+        if 'google_docs' in connected_integrations:
+            available_tools.extend([list_google_docs, read_google_doc, create_google_doc])
+            
+        if 'notion' in connected_integrations:
+            available_tools.extend([search_notion, read_notion_page, create_notion_page])
+            
+        if 'github' in connected_integrations:
+            available_tools.extend([list_github_repos, get_github_repo_info, list_github_issues, create_github_issue])
+        
+        return available_tools
+        
+    except Exception as e:
+        print(f"Error getting user integrations: {e}")
+        return [search_web]  # Return basic tools on error
+
+
+# =============================================================================
+# APP-SPECIFIC DETECTION FUNCTIONS
+# =============================================================================
+
+def is_gmail_query(message: str, conversation_history: List[dict] = None) -> bool:
+    """Robust Gmail query detection."""
+    message = message.lower().strip()
+    
+    # Exclude simple greetings
+    if message in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'yes', 'no', 'ok', 'okay']:
+        return False
+    
+    # Gmail-specific keywords (high confidence)
+    gmail_keywords = [
+        'email', 'emails', 'gmail', 'inbox', 'mail', 'message', 'messages',
+        'compose', 'send', 'reply', 'forward', 'draft', 'recipient', 'subject',
+        'attachment', 'unread', 'read email', 'check email', 'search email',
+        'delete email', 'email from', 'email to', 'sent items', 'spam', 'trash'
+    ]
+    
+    # Check for Gmail keywords
+    for keyword in gmail_keywords:
+        if keyword in message:
+            return True
+    
+    # Gmail-specific patterns
+    gmail_patterns = [
+        r'send .* to .+@.+',  # Send something to email
+        r'email .* about',    # Email someone about something
+        r'check my inbox',    # Check inbox
+        r'read my emails?',   # Read email(s)
+        r'compose .* email',  # Compose email
+        r'search for .* in .* email',  # Search emails
+        r'delete .* email',   # Delete email
+        r'unread emails?',    # Unread emails
+        r'recent emails?',    # Recent emails
+        r'emails? from .+',   # Emails from someone
+    ]
+    
+    for pattern in gmail_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    # Check conversation context
+    if conversation_history:
+        recent_messages = conversation_history[-3:]
+        for msg in recent_messages:
+            if any(keyword in msg.get("content", "").lower() for keyword in gmail_keywords[:5]):
+                return True
+    
+    return False
+
+
+def is_google_calendar_query(message: str, conversation_history: List[dict] = None) -> bool:
+    """Robust Google Calendar query detection."""
+    message = message.lower().strip()
+    
+    # Exclude simple greetings
+    if message in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'yes', 'no', 'ok', 'okay']:
+        return False
+    
+    # Calendar-specific keywords
+    calendar_keywords = [
+        'calendar', 'event', 'events', 'meeting', 'meetings', 'appointment',
+        'schedule', 'scheduled', 'reschedule', 'cancel', 'book', 'booking',
+        'agenda', 'busy', 'available', 'free', 'time', 'remind', 'reminder',
+        'today', 'tomorrow', 'next week', 'this week', 'upcoming'
+    ]
+    
+    # Check for calendar keywords
+    for keyword in calendar_keywords:
+        if keyword in message:
+            return True
+    
+    # Calendar-specific patterns
+    calendar_patterns = [
+        r'schedule .* meeting',
+        r'book .* appointment',
+        r'add .* event',
+        r'create .* event',
+        r'check my calendar',
+        r'what\'s on my calendar',
+        r'free time',
+        r'available time',
+        r'meeting .* (today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+        r'(today|tomorrow)\'s agenda',
+        r'this week\'s events',
+        r'next week\'s schedule',
+        r'cancel .* meeting',
+        r'reschedule .* event',
+    ]
+    
+    for pattern in calendar_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    # Time-related expressions that suggest calendar
+    time_patterns = [
+        r'\d+:\d+\s*(am|pm)',  # Time format like 2:30 PM
+        r'(monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+        r'(january|february|march|april|may|june|july|august|september|october|november|december)',
+        r'\d+/\d+',  # Date format
+        r'at \d+',   # at 3, at 5, etc.
+    ]
+    
+    for pattern in time_patterns:
+        if re.search(pattern, message) and any(word in message for word in ['meeting', 'event', 'schedule', 'book', 'appointment']):
+            return True
+    
+    return False
+
+
+def is_google_docs_query(message: str, conversation_history: List[dict] = None) -> bool:
+    """Robust Google Docs query detection."""
+    message = message.lower().strip()
+    
+    # Exclude simple greetings
+    if message in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'yes', 'no', 'ok', 'okay']:
+        return False
+    
+    # If message contains notion-specific keywords, don't treat as docs (use word boundaries)
+    notion_exclusions = [r'\bnotion\b', r'page in notion', r'notion page', r'\bworkspace\b', r'knowledge base']
+    for exclusion in notion_exclusions:
+        if re.search(exclusion, message):
+            return False
+    
+    # If message contains github-specific keywords, don't treat as docs (use word boundaries)
+    github_exclusions = [r'\bissue\b', r'\bgithub\b', r'\brepository\b', r'\brepo\b', r'pull request', r'\bcommit\b']
+    for exclusion in github_exclusions:
+        if re.search(exclusion, message):
+            return False
+    
+    # Google Docs-specific keywords (more specific)
+    docs_keywords = [
+        'google docs', 'document', 'doc', 'docs', 'write', 'writing', 'edit',
+        'editing', 'text document', 'report', 'draft', 'content', 'paragraph', 
+        'share document', 'sharing', 'collaborate', 'format'
+    ]
+    
+    # Check for docs keywords
+    for keyword in docs_keywords:
+        if keyword in message:
+            return True
+    
+    # Docs-specific patterns (more specific)
+    docs_patterns = [
+        r'create .* (document|doc)',
+        r'write .* (doc|document|report)',
+        r'edit .* document',
+        r'open .* document',
+        r'share .* document',
+        r'my documents',
+        r'document .* (about|on|for)',
+        r'draft .* report',
+        r'text document',
+    ]
+    
+    for pattern in docs_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    return False
+
+
+def is_notion_query(message: str, conversation_history: List[dict] = None) -> bool:
+    """Robust Notion query detection."""
+    message = message.lower().strip()
+    
+    # Exclude simple greetings
+    if message in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'yes', 'no', 'ok', 'okay']:
+        return False
+    
+    # Strong Notion indicators (explicit mentions)
+    strong_notion_keywords = ['notion', 'notion workspace', 'notion page', 'knowledge base']
+    for keyword in strong_notion_keywords:
+        if keyword in message:
+            return True
+    
+    # Notion-specific keywords
+    notion_keywords = [
+        'page', 'pages', 'database', 'databases', 'workspace',
+        'wiki', 'organize', 'organization', 'structure',
+        'template', 'templates', 'block', 'blocks', 'property', 'properties'
+    ]
+    
+    # Check for notion keywords
+    for keyword in notion_keywords:
+        if keyword in message:
+            return True
+    
+    # Notion-specific patterns
+    notion_patterns = [
+        r'create .* page',
+        r'new .* page',
+        r'page .* (about|for|on)',
+        r'add .* page',
+        r'search .* workspace',
+        r'my workspace',
+        r'organize .* information',
+        r'structure .* data',
+        r'find notes .* project',  # More specific pattern
+        r'notes .* project',  # Specific for project notes
+    ]
+    
+    for pattern in notion_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    return False
+    
+    # Notion-specific patterns
+    notion_patterns = [
+        r'create .* page',
+        r'add .* page',
+        r'notion page',
+        r'search .* notion',
+        r'find .* notion',
+        r'my workspace',
+        r'knowledge base',
+        r'organize .* information',
+        r'structure .* data',
+        r'add .* note',
+        r'create .* note',
+        r'note .* about',
+    ]
+    
+    for pattern in notion_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    return False
+
+
+def is_github_query(message: str, conversation_history: List[dict] = None) -> bool:
+    """Robust GitHub query detection."""
+    message = message.lower().strip()
+    
+    # Exclude simple greetings
+    if message in ['hi', 'hello', 'hey', 'thanks', 'thank you', 'yes', 'no', 'ok', 'okay']:
+        return False
+    
+    # Strong GitHub indicators (explicit mentions) - highest priority
+    strong_github_keywords = ['github', 'issue', 'issues', 'pull request', 'pr', 'repository', 'repo', 'repos']
+    for keyword in strong_github_keywords:
+        if keyword in message:
+            return True
+    
+    # If message contains document-related words, likely not GitHub
+    document_indicators = ['document', 'doc', 'docs', 'write', 'report', 'notes', 'note', 'notion', 'edit', 'editing']
+    has_document_context = any(indicator in message for indicator in document_indicators)
+    
+    if has_document_context:
+        return False
+    
+    # GitHub-specific keywords (only if no document context)
+    github_keywords = [
+        'code', 'coding', 'bug', 'bugs', 'feature', 
+        'commit', 'commits', 'branch', 'branches', 'fork', 'clone',
+        'development', 'dev', 'programming', 'software'
+    ]
+    
+    # Check for github keywords
+    for keyword in github_keywords:
+        if keyword in message:
+            return True
+    
+    # GitHub-specific patterns
+    github_patterns = [
+        r'create .* issue',
+        r'new .* issue',
+        r'open .* issue',
+        r'list .* repos?',
+        r'my repositories',
+        r'check .* repo',
+        r'repository .* (for|about|on)',
+        r'github .* (project|repo)',
+        r'clone .* repo',
+        r'fork .* repo',
+        r'pull request',
+        r'merge .* branch',
+        r'commit .* changes',
+        r'push .* code',
+    ]
+    
+    for pattern in github_patterns:
+        if re.search(pattern, message):
+            return True
+    
+    return False
+
+
+def detect_specific_app_intent(message: str, conversation_history: List[dict] = None) -> Optional[str]:
+    """
+    Detect which specific app the user wants to use with robust detection logic.
+    Returns the app type or None if no specific app is detected.
+    """
+    # Check each app in order of specificity (most specific first)
+    # Apps with explicit mentions should be prioritized
+    
+    if is_gmail_query(message, conversation_history):
+        return 'gmail'
+    elif is_google_calendar_query(message, conversation_history):
+        return 'google_calendar'
+    elif is_google_docs_query(message, conversation_history):
+        return 'google_docs'
+    elif is_notion_query(message, conversation_history):
+        return 'notion'
+    elif is_github_query(message, conversation_history):
+        return 'github'
+    
+    return None
+
+
+# =============================================================================
+# APP-SPECIFIC QUERY PROCESSORS
+# =============================================================================
+
+def process_gmail_query_with_agent(message: str, user_id: str, conversation_history: List[dict] = None) -> str:
+    """Process Gmail queries using dedicated Gmail agent."""
+    try:
+        # Set the user context for tools
+        set_user_context(user_id)
+        # Use the dedicated Gmail agent
+        agent = gmail_agent
+        
+        # Create Gmail-specific prompt
+        prompt = f"""You are a Gmail assistant. Help the user with their Gmail-related request: {message}
+        
+        Available actions:
+        - Read and summarize emails
+        - Send emails to specific recipients
+        - Search for specific emails
+        - Delete emails (with confirmation)
+        
+        User request: {message}"""
+        
+        # Create and run Gmail task
+        task = Task(
+            description=prompt,
+            expected_output="A helpful response addressing the Gmail request",
+            agent=agent
+        )
+        
+        crew = Crew(
+            agents=[agent],
+            tasks=[task],
+            process=Process.sequential,
+            verbose=True
+        )
+        
+        result = crew.kickoff()
+        return str(result)
+        
+    except Exception as e:
+        return f"I encountered an error while processing your Gmail request: {str(e)}"
+
+
+def process_google_calendar_query_with_agent(message: str, user_id: str, conversation_history: List[dict] = None) -> str:
+    """Process Google Calendar queries using dedicated Calendar agent."""
+    try:
+        # Set the user context for tools
+        set_user_context(user_id)
+        
+        # Use the dedicated Google Calendar agent
+        agent = google_calendar_agent
+        
+        # Create Calendar-specific prompt
+        prompt = f"""You are a Google Calendar assistant. Help the user with their calendar and scheduling request: {message}
+        
+        Available actions:
+        - List upcoming events and appointments
+        - Create new calendar events and meetings
+        - Check availability and free time
+        - Manage scheduling conflicts
+        
+        User request: {message}"""
+        
+        # Create and run Calendar task
+        task = Task(
+            description=prompt,
+            expected_output="A helpful response addressing the Calendar request",
+            agent=agent
+        )
+        
+        crew = Crew(
+            agents=[agent],
+            tasks=[task],
+            process=Process.sequential,
+            verbose=True
+        )
+        
+        result = crew.kickoff()
+        return str(result)
+        
+    except Exception as e:
+        return f"I encountered an error while processing your Calendar request: {str(e)}"
+
+
+def process_google_docs_query_with_agent(message: str, user_id: str, conversation_history: List[dict] = None) -> str:
+    """Process Google Docs queries using dedicated Docs agent."""
+    try:
+        # Set user context for thread-local access
+        set_user_context(user_id)
+        
+        # Use the dedicated Google Docs agent
+        agent = google_docs_agent
+        
+        # Create Docs-specific prompt
+        prompt = f"""You are a Google Docs assistant. Help the user with their document-related request: {message}
+        
+        Available actions:
+        - List and find documents
+        - Read and analyze document content
+        - Create new documents with specific content
+        - Help with document organization
+        
+        User request: {message}"""
+        
+        # Create and run Docs task
+        task = Task(
+            description=prompt,
+            expected_output="A helpful response addressing the Docs request",
+            agent=agent
+        )
+        
+        crew = Crew(
+            agents=[agent],
+            tasks=[task],
+            process=Process.sequential,
+            verbose=True
+        )
+        
+        result = crew.kickoff()
+        return str(result)
+        
+    except Exception as e:
+        return f"I encountered an error while processing your Google Docs request: {str(e)}"
+
+
+def process_notion_query_with_agent(message: str, user_id: str, conversation_history: List[dict] = None) -> str:
+    """Process Notion queries using dedicated Notion agent."""
+    try:
+        # Use the dedicated Notion agent
+        agent = notion_agent
+        
+        # Create Notion-specific prompt
+        prompt = f"""You are a Notion assistant. Help the user with their Notion workspace request: {message}
+        
+        Available actions:
+        - Search for pages and content in workspace
+        - Read and analyze page content
+        - Create new pages and organize information
+        - Help with knowledge management
+        
+        User request: {message}"""
+        
+        # Create and run Notion task
+        task = Task(
+            description=prompt,
+            expected_output="A helpful response addressing the Notion request",
+            agent=agent
+        )
+        
+        crew = Crew(
+            agents=[agent],
+            tasks=[task],
+            process=Process.sequential,
+            verbose=True
+        )
+        
+        result = crew.kickoff()
+        return str(result)
+        
+    except Exception as e:
+        return f"I encountered an error while processing your Notion request: {str(e)}"
+
+
+def process_github_query_with_agent(message: str, user_id: str, conversation_history: List[dict] = None) -> str:
+    """Process GitHub queries using dedicated GitHub agent."""
+    try:
+        # Use the dedicated GitHub agent
+        agent = github_agent
+        
+        # Create GitHub-specific prompt
+        prompt = f"""You are a GitHub assistant. Help the user with their GitHub and development request: {message}
+        
+        Available actions:
+        - List and explore repositories
+        - Get detailed repository information and README
+        - List and manage issues
+        - Create new issues and track bugs
+        - Analyze project structure and code
+        
+        User request: {message}"""
+        
+        # Create and run GitHub task
+        task = Task(
+            description=prompt,
+            expected_output="A helpful response addressing the GitHub request",
+            agent=agent
+        )
+        
+        crew = Crew(
+            agents=[agent],
+            tasks=[task],
+            process=Process.sequential,
+            verbose=True
+        )
+        
+        result = crew.kickoff()
+        return str(result)
+        
+    except Exception as e:
+        return f"I encountered an error while processing your GitHub request: {str(e)}"
 
 def create_research_task(user_query: str) -> Task:
     """Create a research task for the Research Agent."""
@@ -334,7 +1047,8 @@ def process_gmail_query(user_query: str, user_id: str, conversation_context: str
 def process_user_query(user_query: str):
     """Process user query using CrewAI agents with Gemini LLM."""
     # Get fresh agents with current LLM configuration
-    research_agent, analysis_agent, writer_agent, _ = get_agents()  # Ignore gmail_agent
+    agents = get_agents()  # Get all agents
+    research_agent, analysis_agent, writer_agent = agents[0], agents[1], agents[2]  # Take first 3
     llm = get_llm()
     
     # Create the research task

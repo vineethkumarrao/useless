@@ -62,42 +62,50 @@ export function GmailConnectDialog({ open, onOpenChange }: GmailConnectDialogPro
         'width=500,height=600,scrollbars=yes,resizable=yes'
       )
 
-      // Listen for OAuth completion
-      const checkClosed = setInterval(() => {
-        if (authWindow?.closed) {
-          clearInterval(checkClosed)
-          setIsConnecting(false)
-          
-          // Check connection status after OAuth window closes
-          setTimeout(() => {
-            checkGmailConnection()
-          }, 1000)
-        }
-      }, 1000)
+      if (!authWindow) {
+        throw new Error('Popup blocked by browser. Please allow popups for this site.')
+      }
 
-      // Listen for successful OAuth message from popup
+      // Set a timeout for the OAuth process (5 minutes max)
+      const maxWaitTime = 300000; // 5 minutes
+      const timeoutId = setTimeout(() => {
+        setIsConnecting(false)
+        setConnectionStatus('error')
+        // Don't call close() here to avoid COOP issues
+        // Clean up listeners
+        window.removeEventListener('message', handleMessage)
+        console.warn('OAuth timeout reached')
+      }, maxWaitTime)
+
+      // Listen for OAuth completion
       const handleMessage = (event: MessageEvent) => {
-        // Accept messages from backend
-        if (event.origin !== (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000')) return
+        // Allow messages from backend origin
+        const backendOrigin = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+        if (event.origin !== backendOrigin && event.origin !== window.location.origin) return
+        
+        console.log('Received message:', event.data)
         
         if (event.data.type === 'GMAIL_AUTH_SUCCESS') {
+          console.log('Gmail auth success:', event.data)
           setIsConnected(true)
           setConnectionStatus('connected')
           setIsConnecting(false)
-          authWindow?.close()
-          clearInterval(checkClosed)
+          clearTimeout(timeoutId)
           window.removeEventListener('message', handleMessage)
+          // Don't close the window here - let the backend HTML handle it
         } else if (event.data.type === 'GMAIL_AUTH_ERROR') {
           console.error('Gmail auth error:', event.data.error)
           setConnectionStatus('error')
           setIsConnecting(false)
-          authWindow?.close()
-          clearInterval(checkClosed)
+          clearTimeout(timeoutId)
           window.removeEventListener('message', handleMessage)
+          // Don't close the window here
         }
       }
 
       window.addEventListener('message', handleMessage)
+
+      // No periodic checks - rely on message and timeout only
 
     } catch (error) {
       console.error('Error connecting Gmail:', error)

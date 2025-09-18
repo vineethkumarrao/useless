@@ -12,6 +12,7 @@ interface ChatContextType {
   selectConversation: (conversationId: string) => Promise<void>;
   reloadCurrentConversation: () => Promise<void>;
   loadConversations: () => Promise<void>;
+  addOptimisticMessage: (message: Message) => void;
   userId: string | null;
 }
 
@@ -100,6 +101,10 @@ export function ChatProvider({ children, userId }: { children: ReactNode; userId
     }
   };
 
+  const addOptimisticMessage = (message: Message) => {
+    setCurrentMessages(prev => [...prev, message]);
+  };
+
   useEffect(() => {
     if (userId) {
       loadConversations();
@@ -122,6 +127,7 @@ export function ChatProvider({ children, userId }: { children: ReactNode; userId
     selectConversation,
     loadConversations,
     reloadCurrentConversation,
+    addOptimisticMessage,
     userId,
   };
 
