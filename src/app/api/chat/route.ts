@@ -1,0 +1,44 @@
+import { NextRequest, NextResponse } from 'next/server';
+
+// Python FastAPI backend URL
+const PYTHON_BACKEND_URL = 'http://localhost:8000';
+
+export async function POST(request: NextRequest) {
+  try {
+    const { messages } = await request.json();
+
+    if (!messages || !Array.isArray(messages)) {
+      return NextResponse.json({ error: 'Invalid messages' }, { status: 400 });
+    }
+
+    console.log('Proxying request to Python FastAPI backend...');
+    
+    // Forward the request to the Python FastAPI backend
+    const response = await fetch(PYTHON_BACKEND_URL + '/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ messages }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Python backend error:', response.status, errorText);
+      return NextResponse.json(
+        { error: 'Backend service error' }, 
+        { status: response.status }
+      );
+    }
+
+    const data = await response.json();
+    console.log('Received response from Python backend');
+    
+    // Return the response from the Python backend
+    return NextResponse.json(data);
+
+  } catch (error) {
+    console.error('Chat API proxy error:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
