@@ -66,39 +66,21 @@ export function ChatProvider({ children, userId }: { children: ReactNode; userId
 
   const reloadCurrentConversation = async () => {
     if (!userId || !currentConversationId) return;
-    setIsLoadingMessages(true);
-    try {
-      const { data, error } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('conversation_id', currentConversationId)
-        .order('created_at', { ascending: true });
-      if (error) throw error;
-      setCurrentMessages(data || []);
-    } catch (error) {
-      console.error('Error reloading messages:', error);
-    } finally {
-      setIsLoadingMessages(false);
-    }
+    
+    // Since we handle messages optimistically and store via FastAPI backend,
+    // we don't need to reload from Supabase. Messages are already in memory.
+    console.log('Conversation messages are handled optimistically');
   };
 
   const selectConversation = async (conversationId: string) => {
     if (!userId) return;
     setCurrentConversationId(conversationId);
     setIsLoadingMessages(true);
-    try {
-      const { data, error } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('conversation_id', conversationId)
-        .order('created_at', { ascending: true });
-      if (error) throw error;
-      setCurrentMessages(data || []);
-    } catch (error) {
-      console.error('Error loading messages:', error);
-    } finally {
-      setIsLoadingMessages(false);
-    }
+    
+    // For now, start with empty messages since we handle them optimistically
+    // Our backend stores messages via FastAPI, not directly in Supabase
+    setCurrentMessages([]);
+    setIsLoadingMessages(false);
   };
 
   const addOptimisticMessage = (message: Message) => {

@@ -45,9 +45,35 @@ def run_async_in_thread(coro):
         # No event loop exists, create a new one
         return run_async_in_thread(coro)
 from datetime import datetime, timezone, timedelta
+from memory_manager import memory_manager, email_to_uuid
 
 # Load environment variables
 load_dotenv()
+
+# Helper function to get user context for tools
+async def get_user_context_for_tools(user_id: str, query: str = "") -> str:
+    """Get user context for personalizing tool responses."""
+    try:
+        # Convert email to UUID if needed
+        if "@" in user_id:
+            user_uuid = email_to_uuid(user_id)
+        else:
+            user_uuid = user_id
+            
+        # Search user memory for relevant context
+        user_memories = await memory_manager.search_user_memory(
+            user_id=user_uuid,
+            query=query,
+            match_count=3
+        )
+        
+        if user_memories:
+            context_parts = [memory['content'] for memory in user_memories[:3]]
+            return " | ".join(context_parts)
+        return ""
+    except Exception as e:
+        print(f"Error retrieving user context for tools: {e}")
+        return ""
 
 # Initialize Supabase client for OAuth token retrieval
 url: str = os.environ.get("SUPABASE_URL")
@@ -345,6 +371,9 @@ class GmailReadTool(BaseTool):
             return "Error: No valid Gmail access token found. Please reconnect Gmail."
         
         try:
+            # Get user context for personalized responses
+            user_context = await get_user_context_for_tools(user_id, f"gmail email {query}")
+            
             headers = {"Authorization": f"Bearer {access_token}"}
             
             # Build search parameters
@@ -380,7 +409,7 @@ class GmailReadTool(BaseTool):
                         email_info = self._extract_email_info(email_data)
                         emails.append(email_info)
                 
-                return self._format_emails_response(emails)
+                return self._format_emails_response(emails, user_context)
                 
         except Exception as e:
             return f"Error reading Gmail: {str(e)}"
@@ -425,12 +454,16 @@ class GmailReadTool(BaseTool):
         except Exception:
             return "Error decoding email body"
     
-    def _format_emails_response(self, emails: List[Dict]) -> str:
-        """Format emails for LLM consumption"""
+    def _format_emails_response(self, emails: List[Dict], user_context: str = "") -> str:
+        """Format emails for LLM consumption with user context"""
         if not emails:
             return "No emails found."
         
-        response = f"Found {len(emails)} emails:\n\n"
+        response = f"Found {len(emails)} emails"
+        if user_context:
+            response += f" (considering your context: {user_context[:100]}...)"
+        response += ":\n\n"
+        
         for i, email in enumerate(emails, 1):
             response += f"Email {i}:\n"
             response += f"Subject: {email['subject']}\n"
@@ -439,6 +472,9 @@ class GmailReadTool(BaseTool):
             response += f"Preview: {email['snippet']}\n"
             response += f"Body: {email['body']}\n"
             response += "-" * 50 + "\n\n"
+        
+        if user_context and len(emails) > 0:
+            response += f"\nPersonalized note: Based on your background ({user_context[:150]}...), you might find these emails particularly relevant.\n"
         
         return response
 

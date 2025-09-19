@@ -18,6 +18,9 @@ import {
   RiLeafLine,
   RiSendPlane2Fill,
   RiAddFill,
+  RiWifiLine,
+  RiWifiOffLine,
+  RiErrorWarningLine
 } from "@remixicon/react";
 import { ChatMessage } from "@/components/chat-message";
 import { useRef, useEffect, useState } from "react";
@@ -29,7 +32,19 @@ import type { Message as DBMessage } from "@/lib/supabase";
 interface Message {
   role: "user" | "assistant";
   content: string;
+  type?: string;  // 'simple' | 'complex' | 'error'
 }
+
+// Badge-like styled span
+const StyledBadge = ({ variant = "default", className = "", children }: { variant?: "default" | "secondary" | "destructive"; className?: string; children: React.ReactNode; }) => {
+  const baseClasses = "inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium";
+  const variantClasses = {
+    default: "bg-primary text-primary-foreground",
+    secondary: "bg-secondary text-secondary-foreground",
+    destructive: "bg-destructive text-destructive-foreground"
+  };
+  return <span className={`${baseClasses} ${variantClasses[variant] || "bg-muted text-muted-foreground"} ${className}`}>{children}</span>;
+};
 
 export default function Chat() {
   const [input, setInput] = useState("");
@@ -37,6 +52,7 @@ export default function Chat() {
   const [agentMode, setAgentMode] = useState(false);
   const [selectedApps, setSelectedApps] = useState<string[]>([]);
   const [showAppDropdown, setShowAppDropdown] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<Record<string, boolean>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { user } = useAuth();
   const {
@@ -53,7 +69,33 @@ export default function Chat() {
   const messages: Message[] = currentMessages.map((msg: DBMessage) => ({
     role: msg.role as "user" | "assistant",
     content: msg.content,
+    type: msg.metadata?.type || undefined,
   }));
+
+  // Check connections on mount and agent mode change
+  useEffect(() => {
+    if (agentMode && userId) {
+      checkConnections();
+    }
+  }, [agentMode, userId]);
+
+  const checkConnections = async () => {
+    try {
+      const response = await fetch("/api/integrations/status", {
+        headers: { 
+          "Authorization": `Bearer ${userId}`,
+          "Content-Type": "application/json"
+        },
+      });
+      
+      if (response.ok) {
+        const status = await response.json();
+        setConnectionStatus(status);
+      }
+    } catch (error) {
+      console.error("Connection check failed:", error);
+    }
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -63,13 +105,13 @@ export default function Chat() {
     if (e) e.preventDefault();
     if (!input.trim() || isLoading || !currentConversationId) return;
 
-    const userMessageContent = input;
+    const userMessageContent = input.trim();
     setInput("");
     setIsLoading(true);
 
-    // Add user message optimistically to show immediately in the UI
+    // Add user message optimistically
     const tempUserMessage: DBMessage = {
-      id: `temp-${Date.now()}`, // Temporary ID
+      id: `temp-${Date.now()}`,
       conversation_id: currentConversationId,
       user_id: userId!,
       content: userMessageContent,
@@ -78,23 +120,28 @@ export default function Chat() {
       metadata: {},
     };
     
-    // Show user message immediately
     addOptimisticMessage(tempUserMessage);
 
     try {
-      // Determine if Gmail agent should be used
+      console.log("=== CHAT DEBUG INFO ===");
+      console.log("UserId:", userId);
+      console.log("Message:", userMessageContent);
+      console.log("Conversation ID:", currentConversationId);
+      console.log("Agent Mode:", agentMode);
+      console.log("========================");
+
       const useGmailAgent = agentMode && selectedApps.includes("Gmail");
       
-      // Prepare request body based on agent mode
       const requestBody = {
-        messages: [...messages, { role: "user", content: userMessageContent }],
+        message: userMessageContent,
         conversation_id: currentConversationId,
-        user_id: userId || 'anonymous',
         agent_mode: agentMode,
         selected_apps: selectedApps,
         use_gmail_agent: useGmailAgent
       };
 
+      console.log("Request body:", JSON.stringify(requestBody, null, 2));
+      
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { 
@@ -105,64 +152,81 @@ export default function Chat() {
       });
 
       if (!response.ok) {
-        throw new Error(`API error: ${response.statusText}`);
+        const errorData = await response.text();
+        console.error("API Error Details:", {
+          status: response.status,
+          statusText: response.statusText,
+          errorData: errorData
+        });
+        throw new Error(`API error: ${response.statusText} - ${errorData}`);
       }
 
       const data = await response.json();
-      console.log("Full API Response:", data);
+      console.log("API Response:", data);
 
-      // The backend should have saved both messages and updated conversation
-      // Refresh conversations to update updated_at
-      await loadConversations();
+      // Handle different response types
+      const assistantMessage: DBMessage = {
+        id: `server-${Date.now()}`,
+        conversation_id: currentConversationId,
+        user_id: userId!,
+        content: data.response,
+        role: 'assistant',
+        created_at: new Date().toISOString(),
+        metadata: { type: data.type },
+      };
+      
+      addOptimisticMessage(assistantMessage);
 
-      // Reload the current conversation's messages to show the new messages from database
-      // This will replace the optimistic messages with the real ones from the backend
-      if (currentConversationId) {
-        await reloadCurrentConversation();
-      }
+      // Don't reload - we already have the messages in memory
+      console.log("Chat message processed successfully");
 
     } catch (error) {
       console.error("Chat error:", error);
-      // If there's an error, reload to make sure we have the correct state
-      await reloadCurrentConversation();
+      
+      // Show error message
+      const errorMessage: DBMessage = {
+        id: `error-${Date.now()}`,
+        conversation_id: currentConversationId,
+        user_id: userId!,
+        content: "Sorry, I encountered an error processing your request. Please try again.",
+        role: 'assistant',
+        created_at: new Date().toISOString(),
+        metadata: { type: 'error' },
+      };
+      
+      addOptimisticMessage(errorMessage);
+      
+      // Don't reload on error - keep the conversation in memory
+      console.log("Error handled, conversation preserved");
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Function to toggle agent mode
   const toggleAgentMode = () => {
     setAgentMode(prev => {
       const newMode = !prev;
       if (newMode) {
-        setSelectedApps([]); // Reset when activating
+        setSelectedApps([]); // Reset selections
       }
       return newMode;
     });
   };
 
-  // Function to handle app selection (multi-select)
   const handleAppSelect = (app: string) => {
     setSelectedApps(prev =>
       prev.includes(app) ? prev.filter(a => a !== app) : [...prev, app]
     );
   };
 
-  // Function to confirm selections
   const confirmApps = () => {
-    // Here you can send selectedApps to backend or context
-    console.log("Selected apps for agent:", selectedApps);
-    
-    // Check if Gmail is selected for agent mode
+    console.log("Selected apps:", selectedApps);
     if (selectedApps.includes("Gmail")) {
-      console.log("Gmail agent will be activated for next messages");
-      // You can add visual feedback here if needed
+      console.log("Gmail agent activated");
     }
-    
     setShowAppDropdown(false);
   };
 
-  // Function to cancel selections
   const cancelApps = () => {
     setSelectedApps([]);
     setShowAppDropdown(false);
@@ -179,10 +243,42 @@ export default function Chat() {
   return (
     <ScrollArea className="flex-1 [&>div>div]:h-full w-full shadow-md md:rounded-s-[inherit] min-[1024px]:rounded-e-3xl bg-background">
       <div className="h-full flex flex-col px-4 md:px-6 lg:px-8">
-        {/* Messages start immediately, no header */}
+        {/* Top status bar */}
+        <div className="sticky top-0 z-10 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 pt-4 pb-2 border-b">
+          <div className="max-w-3xl mx-auto flex items-center justify-between">
+            {/* Agent Mode Status */}
+            <div className="flex items-center space-x-2">
+              <StyledBadge variant={agentMode ? "default" : "outline"} className="text-xs">
+                {agentMode ? "🤖 Agent Mode Active" : "💭 Simple Chat"}
+              </StyledBadge>
+              {agentMode && selectedApps.length > 0 && (
+                <StyledBadge variant="secondary" className="text-xs">
+                  {selectedApps.length} App{selectedApps.length > 1 ? 's' : ''}
+                </StyledBadge>
+              )}
+            </div>
+            
+            {/* Connection Status */}
+            {agentMode && Object.keys(connectionStatus).some(status => connectionStatus[status]) && (
+              <div className="flex items-center space-x-2 text-xs text-muted-foreground">
+                <RiWifiLine className="w-4 h-4" />
+                <span>Connections Active</span>
+              </div>
+            )}
+            
+            {/* Conversation ID display */}
+            {currentConversationId && (
+              <div className="text-xs text-muted-foreground">
+                ID: {currentConversationId.substring(0, 8)}...
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Messages area */}
         <div className="relative grow">
           <div className="max-w-3xl mx-auto space-y-4">
-            {messages.length === 0 && (
+            {messages.length === 0 && !isLoading && (
               <div className="text-center my-8">
                 <div className="inline-flex items-center bg-white rounded-full border border-black/[0.08] shadow-xs text-xs font-medium py-1 px-3 text-foreground/80">
                   <RiShining2Line
@@ -193,133 +289,157 @@ export default function Chat() {
                   Today
                 </div>
                 <p className="text-muted-foreground mt-4">
-                  Start a conversation by typing a message below or select from history.
+                  {agentMode 
+                    ? "Agent mode is ready. Select apps above to activate specific tools." 
+                    : "Start chatting! Toggle Agent Mode for advanced features."
+                  }
                 </p>
               </div>
             )}
             {messages.map((message, index) => (
-              <ChatMessage key={index} isUser={message.role === "user"}>
+              <ChatMessage 
+                key={index} 
+                isUser={message.role === "user"}
+                type={message.type}
+              >
                 {message.content}
               </ChatMessage>
             ))}
             {isLoading && (
-              <ChatMessage>
-                <div className="flex items-center justify-start space-x-2">
-                  <div className="animate-pulse bg-muted rounded-full h-2 w-2"></div>
-                  <div
-                    className="animate-pulse bg-muted rounded-full h-2 w-2"
-                    style={{ animationDelay: "0.1s" }}
-                  ></div>
-                  <div
-                    className="animate-pulse bg-muted rounded-full h-2 w-2"
-                    style={{ animationDelay: "0.2s" }}
-                  ></div>
-                  <span className="text-muted-foreground">Typing...</span>
+              <div className="flex items-start space-x-3 p-4">
+                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-muted animate-pulse" />
+                <div className="flex-1 space-y-2">
+                  <div className="flex items-center space-x-2">
+                    <div className="h-3 bg-muted rounded-full animate-pulse w-24" />
+                    <span className="text-xs text-muted-foreground">Thinking...</span>
+                  </div>
+                  <div className="h-4 bg-muted rounded animate-pulse w-3/4" />
+                  <div className="h-4 bg-muted rounded animate-pulse w-1/2" />
                 </div>
-              </ChatMessage>
+              </div>
             )}
             <div ref={messagesEndRef} aria-hidden="true" />
           </div>
         </div>
-        {/* Footer with input and buttons */}
+
+        {/* Input form */}
         <form onSubmit={handleSubmit} className="sticky bottom-0 pt-3 md:pt-6 z-50">
           <div className="max-w-3xl mx-auto bg-background rounded-[20px] pb-3 md:pb-6">
             <div className="relative rounded-[20px] border border-transparent bg-muted transition-colors focus-within:bg-muted/50 focus-within:border-input has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-50 [&:has(input:is(:disabled))_*]:pointer-events-none">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              className="flex sm:min-h-[60px] w-full bg-transparent px-3 py-2 text-sm leading-normal text-foreground placeholder:text-muted-foreground/70 focus-visible:outline-none [resize:none]"
-              placeholder={
-                agentMode && selectedApps.includes("Gmail") 
-                  ? "Gmail agent is active - all messages will use Gmail tools and scopes..." 
-                  : agentMode 
-                    ? "Agent mode is on but no apps selected - acting as normal chatbot..." 
-                    : "Ask me anything..."
-              }
-              aria-label="Enter your prompt"
-              disabled={isLoading}
-            />              <div className="flex items-center justify-between gap-2 p-2">
-                {/* Left section with agent toggle and buttons */}
-                <div className="flex items-center gap-2">
-                  {/* Agent Mode Toggle Button */}
-                  <Button
-                    type="button"
-                    variant={agentMode ? "default" : "outline"}
-                    size="sm"
-                    className="h-7 px-3 text-xs"
-                    onClick={toggleAgentMode}
-                    disabled={isLoading}
-                  >
-                    {agentMode ? "Agent ON" : "Agent OFF"}
-                  </Button>
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                className="flex sm:min-h-[60px] w-full bg-transparent px-3 py-2 text-sm leading-normal text-foreground placeholder:text-muted-foreground/70 focus-visible:outline-none resize-none"
+                placeholder={
+                  agentMode && selectedApps.length > 0
+                    ? `Agent active with ${selectedApps.join(', ')} - Type your request...`
+                    : agentMode
+                      ? "Agent mode active - Select apps above to activate tools..."
+                      : "Ask me anything..."
+                }
+                aria-label="Enter your message"
+                disabled={isLoading}
+                rows={1}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    handleSubmit();
+                  }
+                }}
+              />
+              
+              {/* Input actions */}
+              <div className="flex items-center justify-between gap-2 p-2">
+                {/* Left actions */}
+                <div className="flex items-center gap-1">
+                  {/* Agent toggle */}
+                  <div className="relative">
+                    <Button
+                      type="button"
+                      variant={agentMode ? "default" : "outline"}
+                      size="sm"
+                      className={`h-7 px-3 text-xs transition-all ${agentMode ? 'shadow-md' : ''}`}
+                      onClick={toggleAgentMode}
+                      disabled={isLoading}
+                    >
+                      {agentMode ? (
+                        <>
+                          <RiShining2Line className="w-3 h-3 mr-1" />
+                          Agent ON
+                        </>
+                      ) : (
+                        'Agent OFF'
+                      )}
+                    </Button>
+                    
+                    {/* Agent mode tooltip */}
+                    {agentMode && (
+                      <div className="absolute -top-8 left-1/2 transform -translate-x-1/2 bg-background border rounded-md shadow-lg px-2 py-1 text-xs z-50">
+                        {selectedApps.length > 0 
+                          ? `${selectedApps.length} app${selectedApps.length > 1 ? 's' : ''} active`
+                          : 'No apps selected'
+                        }
+                      </div>
+                    )}
+                  </div>
                   
-                  {/* + App Selection - only in agent mode */}
+                  {/* App selector - only show in agent mode */}
                   {agentMode && (
                     <DropdownMenu open={showAppDropdown} onOpenChange={setShowAppDropdown}>
                       <DropdownMenuTrigger asChild>
                         <Button
                           type="button"
-                          variant="outline"
-                          size="icon"
-                          className="rounded-full size-6 border hover:bg-muted"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
                           disabled={isLoading}
                         >
-                          <RiAddFill className="size-4" />
-                          <span className="sr-only">Select Apps</span>
+                          {selectedApps.length > 0 
+                            ? `${selectedApps.length} App${selectedApps.length > 1 ? 's' : ''}`
+                            : 'Select Apps'
+                          }
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent className="w-56 p-2" align="start">
-                        <DropdownMenuLabel>Apps for Agent Mode</DropdownMenuLabel>
+                        <DropdownMenuLabel>Apps for Agent</DropdownMenuLabel>
                         <DropdownMenuSeparator />
                         
-                        {/* Gmail */}
-                        <DropdownMenuItem 
-                          onSelect={(e) => e.preventDefault()}
-                          className="flex items-center justify-between p-2 cursor-pointer"
-                        >
-                          <div className="flex items-center space-x-2">
-                            <Checkbox
-                              id="gmail"
-                              checked={selectedApps.includes("Gmail")}
-                              onCheckedChange={() => handleAppSelect("Gmail")}
-                            />
-                            <label htmlFor="gmail" className="text-sm font-medium">Gmail</label>
-                          </div>
-                        </DropdownMenuItem>
-                        
-                        {/* Calendar */}
-                        <DropdownMenuItem 
-                          onSelect={(e) => e.preventDefault()}
-                          className="flex items-center justify-between p-2 cursor-pointer"
-                        >
-                          <div className="flex items-center space-x-2">
-                            <Checkbox
-                              id="calendar"
-                              checked={selectedApps.includes("Calendar")}
-                              onCheckedChange={() => handleAppSelect("Calendar")}
-                            />
-                            <label htmlFor="calendar" className="text-sm font-medium">Calendar</label>
-                          </div>
-                        </DropdownMenuItem>
-                        
-                        {/* Notion */}
-                        <DropdownMenuItem 
-                          onSelect={(e) => e.preventDefault()}
-                          className="flex items-center justify-between p-2 cursor-pointer"
-                        >
-                          <div className="flex items-center space-x-2">
-                            <Checkbox
-                              id="notion"
-                              checked={selectedApps.includes("Notion")}
-                              onCheckedChange={() => handleAppSelect("Notion")}
-                            />
-                            <label htmlFor="notion" className="text-sm font-medium">Notion</label>
-                          </div>
-                        </DropdownMenuItem>
+                        {['Gmail', 'Calendar', 'Docs', 'Notion', 'GitHub'].map(app => (
+                          <DropdownMenuItem 
+                            key={app}
+                            onSelect={(e) => e.preventDefault()}
+                            className="flex items-center justify-between p-2 cursor-pointer -m-2 rounded-md"
+                          >
+                            <div className="flex items-center space-x-2">
+                              <Checkbox
+                                id={app.toLowerCase()}
+                                checked={selectedApps.includes(app)}
+                                onCheckedChange={() => handleAppSelect(app)}
+                              />
+                              <label 
+                                htmlFor={app.toLowerCase()} 
+                                className="text-sm font-medium cursor-pointer"
+                              >
+                                {app}
+                              </label>
+                            </div>
+                            <StyledBadge variant={connectionStatus[app.toLowerCase()] ? "default" : "destructive"} className="text-xs">
+                              {connectionStatus[app.toLowerCase()] ? (
+                                <>
+                                  <RiWifiLine className="w-3 h-3 mr-1" />
+                                  Connected
+                                </>
+                              ) : (
+                                <>
+                                  <RiWifiOffLine className="w-3 h-3 mr-1" />
+                                  Connect
+                                </>
+                              )}
+                            </StyledBadge>
+                          </DropdownMenuItem>
+                        ))}
                         
                         <DropdownMenuSeparator />
-                        
-                        {/* OK/Cancel */}
                         <div className="flex justify-end space-x-2 pt-2 border-t">
                           <Button
                             variant="outline"
@@ -327,7 +447,7 @@ export default function Chat() {
                             onClick={cancelApps}
                             className="h-6 px-2 text-xs"
                           >
-                            Cancel
+                            Clear All
                           </Button>
                           <Button
                             size="sm"
@@ -335,62 +455,55 @@ export default function Chat() {
                             className="h-6 px-2 text-xs"
                             disabled={selectedApps.length === 0}
                           >
-                            OK ({selectedApps.length})
+                            Apply ({selectedApps.length})
                           </Button>
                         </div>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   )}
                   
-                  {/* Existing attachment/audio/action buttons */}
-                  <Button type="button" variant="outline" size="icon" className="rounded-full size-8 border-none hover:bg-background hover:shadow-md transition-[box-shadow]" disabled={isLoading}>
-                    <RiAttachment2 className="text-muted-foreground/70 size-5" size={20} aria-hidden="true" />
-                    <span className="sr-only">Attach</span>
+                  {/* Standard input buttons */}
+                  <Button 
+                    type="button" 
+                    variant="ghost" 
+                    size="icon" 
+                    className="rounded-full size-8 hover:bg-muted/50" 
+                    disabled={isLoading}
+                    title="Attach file"
+                  >
+                    <RiAttachment2 className="text-muted-foreground size-4" />
                   </Button>
-                  <Button type="button" variant="outline" size="icon" className="rounded-full size-8 border-none hover:bg-background hover:shadow-md transition-[box-shadow]" disabled={isLoading}>
-                    <RiMicLine className="text-muted-foreground/70 size-5" size={20} aria-hidden="true" />
-                    <span className="sr-only">Audio</span>
-                  </Button>
-                  <Button type="button" variant="outline" size="icon" className="rounded-full size-8 border-none hover:bg-background hover:shadow-md transition-[box-shadow]" disabled={isLoading}>
-                    <RiLeafLine className="text-muted-foreground/70 size-5" size={20} aria-hidden="true" />
-                    <span className="sr-only">Action</span>
+                  <Button 
+                    type="button" 
+                    variant="ghost" 
+                    size="icon" 
+                    className="rounded-full size-8 hover:bg-muted/50" 
+                    disabled={isLoading}
+                    title="Voice input"
+                  >
+                    <RiMicLine className="text-muted-foreground size-4" />
                   </Button>
                 </div>
                 
-                {/* Right buttons - unchanged */}
-                <div className="flex items-center gap-2">
-                  <Button type="button" variant="outline" size="icon" className="rounded-full size-8 border-none hover:bg-background hover:shadow-md transition-[box-shadow]" disabled={isLoading}>
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none">
-                      <g clipPath="url(#icon-a)">
-                        <path fill="url(#icon-b)" d="m8 .333 2.667 5 5 2.667-5 2.667-2.667 5-2.667-5L.333 8l5-2.667L8 .333Z" />
-                        <path stroke="#451A03" strokeOpacity=".04" d="m8 1.396 2.225 4.173.072.134.134.071L14.604 8l-4.173 2.226-.134.071-.072.134L8 14.604l-2.226-4.173-.071-.134-.134-.072L1.396 8l4.173-2.226.134-.071.071-.134L8 1.396Z" />
-                      </g>
-                      <defs>
-                        <linearGradient id="icon-b" x1="8" x2="8" y1=".333" y2="15.667" gradientUnits="userSpaceOnUse">
-                          <stop stopColor="#FDE68A" />
-                          <stop offset="1" stopColor="#F59E0B" />
-                        </linearGradient>
-                        <clipPath id="icon-a">
-                          <path fill="#fff" d="M0 0h16v16H0z" />
-                        </clipPath>
-                      </defs>
-                    </svg>
-                    <span className="sr-only">Generate</span>
-                  </Button>
-                  <Button type="submit" className="rounded-full h-8" disabled={isLoading || !input.trim()}>
-                    {isLoading ? (
-                      <div className="flex items-center space-x-2">
-                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
-                        <span>Thinking...</span>
-                      </div>
-                    ) : (
-                      <>
-                        <RiSendPlane2Fill className="size-4 mr-1" />
-                        Ask Bart
-                      </>
-                    )}
-                  </Button>
-                </div>
+                {/* Send button */}
+                <Button 
+                  type="submit" 
+                  className="rounded-full h-8 px-4 transition-all" 
+                  disabled={isLoading || !input.trim()}
+                  variant={input.trim() ? "default" : "outline"}
+                >
+                  {isLoading ? (
+                    <div className="flex items-center space-x-2">
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                      <span className="text-xs">Thinking...</span>
+                    </div>
+                  ) : (
+                    <>
+                      <RiSendPlane2Fill className={`size-4 mr-1 transition-transform ${input.trim() ? 'rotate-[-20deg]' : ''}`} />
+                      {input.trim() ? 'Send' : 'Ask'}
+                    </>
+                  )}
+                </Button>
               </div>
             </div>
           </div>

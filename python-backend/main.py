@@ -5,6 +5,7 @@ from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Dict, Any
 import os
 import re
+from memory_manager import memory_manager
 from dotenv import load_dotenv
 from crewai_agents import process_user_query, get_llm, detect_specific_app_intent
 from auth_service import auth_service
@@ -70,11 +71,13 @@ class SigninRequest(BaseModel):
 class ChatMessage(BaseModel):
     message: str
     conversation_id: Optional[str] = None
+    agent_mode: bool = True  # Add this field to match test payloads
 
 
 class ChatResponse(BaseModel):
     response: str
     type: str  # 'simple' or 'complex'
+    conversation_id: Optional[str] = None
 
 
 # Add this function after the imports and before other function definitions
@@ -574,11 +577,6 @@ class ChatRequest(BaseModel):
     use_gmail_agent: Optional[bool] = False
 
 
-class ChatResponse(BaseModel):
-    message: Message
-    conversation_id: str
-
-
 # Gmail OAuth models
 class GmailTokenRequest(BaseModel):
     code: str
@@ -966,165 +964,207 @@ async def get_profile(user_id: str):
         raise HTTPException(status_code=500, detail="Failed to get profile")
 
 
+# =============================================================================
+# MEMORY INTEGRATION: VECTOR DB FOR CONVERSATION CONTEXT
+# =============================================================================
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# Global embedding model
+_vector_model = None
+
+def get_vector_embedding_model():
+    """Get sentence transformer model for chat embeddings."""
+    global _vector_model
+    if _vector_model is None:
+        _vector_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _vector_model
+
+async def store_chat_vector(user_id: str, conversation_id: str, message: str, role: str):
+    """Store chat message with embedding in vector DB."""
+    try:
+        model = get_vector_embedding_model()
+        embedding = model.encode(message).tolist()
+        
+        # Insert into chat_history_vectors
+        response = supabase.table('chat_history_vectors').insert({
+            'user_id': user_id,
+            'conversation_id': conversation_id or 'default',
+            'message': message,
+            'role': role,  # 'user' or 'assistant'
+            'embedding': embedding,
+            'created_at': datetime.utcnow().isoformat()
+        }).execute()
+        
+        if response.data:
+            print(f"Stored chat vector for user {user_id}, conv {conversation_id}")
+        else:
+            print(f"Failed to store chat vector for user {user_id}")
+            
+    except Exception as e:
+        print(f"Error storing chat vector: {e}")
+
+async def retrieve_chat_context(
+    user_id: str, 
+    conversation_id: str, 
+    query: str, 
+    k: int = 5
+) -> str:
+    """Retrieve relevant chat history with fallback if vector search not available."""
+    try:
+        if not query.strip():
+            return ""
+        
+        model = get_vector_embedding_model()
+        query_embedding = model.encode(query).tolist()
+        
+        # Try vector similarity search first
+        try:
+            response = supabase.rpc('match_chat_history', {
+                'query_embedding': query_embedding,
+                'user_id': user_id,
+                'conversation_id': conversation_id or 'default',
+                'match_threshold': 0.7,
+                'match_count': k
+            }).execute()
+        except Exception as rpc_error:
+            print(f"Vector search RPC failed: {rpc_error}")
+            # Fallback to recent messages
+            fallback_query = """
+            SELECT message, role 
+            FROM chat_history_vectors 
+            WHERE user_id = %s 
+              AND conversation_id = %s 
+            ORDER BY created_at DESC 
+            LIMIT %s
+            """
+            response = supabase.table('chat_history_vectors').select('message', 'role')\
+                .eq('user_id', user_id)\
+                .eq('conversation_id', conversation_id or 'default')\
+                .order('created_at', desc=True)\
+                .limit(k)\
+                .execute()
+        
+        if not response.data:
+            return ""
+        
+        context = []
+        for row in response.data:
+            context.append(f"{row['role'].title()}: {row['message']}")
+        
+        context_str = "\n".join(context[-k:])
+        return f"Recent conversation context:\n{context_str}"
+        
+    except Exception as e:
+        print(f"Error retrieving chat context (fallback): {e}")
+        return ""
+
+# Update the chat endpoint to use memory
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
-    request: ChatRequest, current_user: str = Depends(get_current_user)
+    request: ChatMessage,
+    user_id: str = Depends(get_current_user)
 ):
-    """
-    Main chat endpoint that handles both simple and complex queries.
-    Creates conversation if none provided, saves messages, generates response.
-    """
-    print(f"DEBUG: Received chat request")
-    print(f"DEBUG: Current user: {current_user}")
-    print(f"DEBUG: Request type: {type(request)}")
-    print(
-        f"DEBUG: Request dict: {request.dict() if hasattr(request, 'dict') else 'No dict method'}"
-    )
-
-    user_id = current_user
+    """Enhanced chat endpoint with vector memory integration."""
+    message = request.message
     conversation_id = request.conversation_id
-
+    agent_mode = request.agent_mode  # Now from request body
+    
     try:
-        # Ensure user exists
-        await ensure_user_exists(user_id)
-
-        # If no conversation_id, create new one
-        if not conversation_id:
-            conversation_id = await create_conversation(user_id)
-
-        # Save user message
-        user_content = request.messages[-1].content if request.messages else ""
-        await save_message(conversation_id, user_id, user_content, "user")
-
-        # Get conversation history for context
-        history = await get_conversation_messages(conversation_id, user_id)
-        conversation_history = [
-            {"role": msg["role"], "content": msg["content"]} for msg in history
-        ]
-
-        # Determine response type based on agent mode
-        message_text = (
-            request.messages[-1].content if request.messages else user_content
+        # Retrieve conversation context for memory
+        context = await retrieve_chat_context(user_id, conversation_id, message)
+        print(f"DEBUG: Retrieved context for {conversation_id}: {repr(context)}")
+        
+        # Convert context to conversation history format
+        conversation_history = []
+        if context:
+            # Parse the context string to extract conversation history
+            lines = context.split('\n')
+            for line in lines:
+                if line.startswith('User: '):
+                    conversation_history.append({
+                        'role': 'user',
+                        'content': line[6:]  # Remove "User: " prefix
+                    })
+                elif line.startswith('Assistant: '):
+                    conversation_history.append({
+                        'role': 'assistant', 
+                        'content': line[11:]  # Remove "Assistant: " prefix
+                    })
+        
+        print(f"DEBUG: Conversation history: {conversation_history}")
+        
+        # Store user message
+        await store_chat_vector(user_id, conversation_id, message, 'user')
+        
+        # Use async version directly since we're in async context
+        from crewai_agents import process_user_query_async
+        response_text = await process_user_query_async(
+            message,  # Pass original message, let agent handle context
+            user_id, 
+            agent_mode, 
+            conversation_id, 
+            conversation_history  # Pass actual conversation history
         )
-        print(f"DEBUG: message_text = '{message_text}'")
-        print(f"DEBUG: conversation_history = {conversation_history}")
-        print(f"DEBUG: agent_mode = {request.agent_mode}")
-        print(f"DEBUG: selected_apps = {request.selected_apps}")
-        print(f"DEBUG: use_gmail_agent = {request.use_gmail_agent}")
-
-        assistant_content = ""
-
-        # =================================================================
-        # AGENT ON/OFF MODE - CLEAN SEPARATION IMPLEMENTATION
-        # =================================================================
-        # 
-        # Agent OFF Mode (agent_mode = False):
-        #   - Uses ONLY simple_ai_response() function
-        #   - No CrewAI agents triggered
-        #   - No auto-detection of app intents
-        #   - Optional Tavily search for current information
-        #   - Simple, direct responses
-        #
-        # Agent ON Mode (agent_mode = True):
-        #   - Uses full CrewAI agent system
-        #   - Auto-detection and app-specific agents
-        #   - Complex analysis and research capabilities
-        #   - Integration with selected apps
-        # =================================================================
-
-        # Agent mode logic: Clean separation between Agent ON and Agent OFF
-        if request.agent_mode:
-            # AGENT ON MODE: Use CrewAI agents and app integrations
-            if request.selected_apps:
-                # Handle specific integration agent based on selected apps
-                selected_integration = None
-
-                # Map frontend app names to integration types
-                app_to_integration = {
-                    "Gmail": "gmail",
-                    "Google Calendar": "google_calendar",
-                    "Google Docs": "google_docs",
-                    "Notion": "notion",
-                    "GitHub": "github",
-                }
-
-                # Find the first selected integration that we support
-                for app in request.selected_apps:
-                    if app in app_to_integration:
-                        selected_integration = app_to_integration[app]
-                        break
-
-                if selected_integration:
-                    # Use the selected integration's dedicated agent
-                    assistant_content = await process_specific_app_query(
-                        message_text, user_id, selected_integration, conversation_history
-                    )
-                else:
-                    # No valid integration selected, use general CrewAI agent
-                    try:
-                        context = await get_context_for_query(user_id, message_text)
-                        full_prompt = f"{context}\n\nCurrent query: {message_text}"
-                        result = process_user_query(full_prompt)
-                        assistant_content = result
-                    except Exception as e:
-                        logger.error(f"General agent error: {e}")
-                        assistant_content = (
-                            "I had trouble processing your request. Please try again later."
-                        )
-            else:
-                # Agent ON but no specific apps selected - auto-detect and use CrewAI
-                detected_app = detect_specific_app_intent(
-                    message_text, conversation_history
-                )
-                print(f"DEBUG: detected_app = {detected_app}")
-
-                if detected_app:
-                    # Handle detected app query with dedicated agent
-                    assistant_content = await process_specific_app_query(
-                        message_text, user_id, detected_app, conversation_history
-                    )
-                else:
-                    # Check if it's a simple message
-                    is_simple = is_simple_message(message_text)
-                    print(f"DEBUG: is_simple = {is_simple}")
-
-                    if not is_simple:
-                        # Complex query - use CrewAI agents
-                        try:
-                            context = await get_context_for_query(user_id, message_text)
-                            full_prompt = f"{context}\n\nCurrent query: {message_text}"
-                            result = process_user_query(full_prompt)
-                            assistant_content = result
-                        except Exception as e:
-                            logger.error(f"CrewAI error: {e}")
-                            assistant_content = "I had trouble processing your complex request. Please try simplifying your question or try again later."
-                    else:
-                        # Simple response even in Agent ON mode
-                        assistant_content = await simple_ai_response(message_text, user_id)
-        else:
-            # AGENT OFF MODE: Only use simple_ai_response (no CrewAI agents, no auto-detection)
-            print("DEBUG: Agent OFF mode - using simple_ai_response only")
-            assistant_content = await simple_ai_response(message_text, user_id)
-
-        # Save assistant message
-        await save_message(conversation_id, user_id, assistant_content, "assistant")
-
-        # Update conversation updated_at (trigger should handle, but ensure)
-        supabase.table("conversations").update(
-            {"updated_at": datetime.now().isoformat()}
-        ).eq("id", conversation_id).execute()
-
+        
+        # Store assistant response
+        await store_chat_vector(user_id, conversation_id, response_text, 'assistant')
+        
+        # Determine response type
+        response_type = 'complex' if agent_mode else 'simple'
+        
         return ChatResponse(
-            message=Message(role="assistant", content=assistant_content),
-            conversation_id=conversation_id,
+            response=response_text, 
+            type=response_type, 
+            conversation_id=conversation_id
         )
-
+        
     except Exception as e:
         logger.error(f"Chat endpoint error: {e}")
-        raise HTTPException(
-            status_code=500, detail="Internal server error during chat processing"
+        error_response = f"I apologize, but I encountered an error: {str(e)}"
+        await store_chat_vector(user_id, conversation_id, error_response, 'assistant')
+        return ChatResponse(
+            response=error_response, 
+            type='error', 
+            conversation_id=conversation_id
         )
 
+# Add API proxy endpoint for frontend compatibility
+@app.post("/api/chat")
+async def api_chat_endpoint(
+    request: ChatMessage,
+    user_id: str = Depends(get_current_user),
+    authorization: str = Header(None)
+):
+    """Proxy endpoint for frontend compatibility."""
+    # Extract message from either format
+    if request.messages and len(request.messages) > 0:
+        message = request.messages[-1].get('content', '')  # Last user message
+    else:
+        message = request.message or ''
+    
+    if not message.strip():
+        raise HTTPException(400, detail="Message content is required")
+    
+    # Use internal chat processing
+    from crewai_agents import process_user_query
+    response_text = process_user_query(
+        message, 
+        user_id, 
+        request.agent_mode, 
+        request.conversation_id,
+        request.messages if request.messages else []  # Pass full history
+    )
+    
+    # Determine response type (same logic as main endpoint)
+    response_type = 'complex' if request.agent_mode else 'simple'
+    
+    return ChatResponse(
+        response=response_text, 
+        type=response_type, 
+        conversation_id=request.conversation_id
+    )
 
 # Gmail OAuth endpoints
 @app.get("/auth/gmail/debug/{user_id}")
@@ -2211,9 +2251,7 @@ async def disconnect_google_calendar(user_id: str):
 
     except Exception as e:
         logger.error(f"Error disconnecting Google Calendar: {e}")
-        raise HTTPException(
-            status_code=500, detail="Failed to disconnect Google Calendar"
-        )
+        raise HTTPException(status_code=500, detail="Failed to disconnect Google Calendar")
 
 
 @app.get("/auth/google-calendar/status/{user_id}")
@@ -2262,28 +2300,18 @@ async def authorize_google_docs(user_id: str):
         # Use specific redirect URI for Google Docs
         redirect_uri = f"{os.getenv('NEXT_PUBLIC_API_URL', 'http://localhost:8000')}/auth/google-docs/callback"
 
-        # Google Docs OAuth scopes
-        scopes = [
-            "https://www.googleapis.com/auth/documents",
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "https://www.googleapis.com/auth/userinfo.profile",
-        ]
-        scope_string = " ".join(scopes)
-
+        # Google Docs OAuth URL parameters
         from urllib.parse import urlencode
 
         auth_params = {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": scope_string,
-            "access_type": "offline",
-            "prompt": "consent",
+            "owner": "user",
             "state": user_id,
         }
 
-        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
+        auth_url = "https://api.notion.com/v1/oauth/authorize?" + urlencode(
             auth_params
         )
 
@@ -3115,6 +3143,44 @@ async def disconnect_github(user_id: str):
         logger.error(f"Error disconnecting GitHub: {e}")
         raise HTTPException(status_code=500, detail="Failed to disconnect GitHub")
 
+
+# Add integrations status endpoint after existing endpoints
+
+@app.get("/api/integrations/status")
+async def get_integrations_status(user_id: str = Depends(get_current_user)):
+    """Get status of all OAuth integrations for the current user."""
+    try:
+        # Define all possible integrations
+        integrations = ['gmail', 'github', 'google_calendar', 'google_docs', 'notion']
+        
+        status = {}
+        for integration in integrations:
+            # Check if integration exists and has valid token
+            result = supabase.table('oauth_integrations')\
+                .select('access_token, token_expires_at')\
+                .eq('user_id', user_id)\
+                .eq('integration_type', integration)\
+                .execute()
+            
+            connected = bool(result.data and result.data[0].get('access_token'))
+            
+            # For Google services, validate token expiration
+            if connected and integration in ['gmail', 'google_calendar', 'google_docs']:
+                token_data = result.data[0]
+                expires_at_str = token_data['token_expires_at']
+                if expires_at_str:
+                    expires_at = datetime.fromisoformat(expires_at_str)
+                    connected = (expires_at - datetime.now(timezone.utc)) > timedelta(minutes=5)
+            
+            status[integration] = connected
+        
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error getting integrations status: {e}")
+        # Return empty status on error (don't break UI)
+        return {integration: False for integration in ['gmail', 'github', 'google_calendar', 'google_docs', 'notion']}
+    
 
 if __name__ == "__main__":
     import uvicorn

@@ -6,7 +6,7 @@ const PYTHON_BACKEND_URL = 'http://localhost:8000';
 export async function POST(request: NextRequest) {
   try {
     const { 
-      messages, 
+      message,
       conversation_id, 
       user_id, 
       agent_mode = false, 
@@ -14,8 +14,8 @@ export async function POST(request: NextRequest) {
       use_gmail_agent = false 
     } = await request.json();
 
-    if (!messages || !Array.isArray(messages)) {
-      return NextResponse.json({ error: 'Invalid messages' }, { status: 400 });
+    if (!message || typeof message !== 'string') {
+      return NextResponse.json({ error: 'Invalid message' }, { status: 400 });
     }
 
     // Get authorization header from the incoming request
@@ -25,6 +25,7 @@ export async function POST(request: NextRequest) {
     }
 
     console.log('Proxying request to Python FastAPI backend...');
+    console.log('Message:', message);
     console.log('Agent Mode:', agent_mode, 'Selected Apps:', selected_apps, 'Use Gmail Agent:', use_gmail_agent);
     
     // Forward the request to the Python FastAPI backend with conversation context and agent info
@@ -35,12 +36,9 @@ export async function POST(request: NextRequest) {
         'Authorization': authorization, // Forward the authorization header
       },
       body: JSON.stringify({ 
-        messages, 
+        message,
         conversation_id,
-        user_id,
-        agent_mode,
-        selected_apps,
-        use_gmail_agent
+        agent_mode
       }),
     });
 
