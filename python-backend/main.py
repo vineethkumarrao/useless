@@ -351,31 +351,103 @@ def is_gmail_query(message: str, conversation_history: List[dict] = None) -> boo
     return False
 
 
-async def simple_ai_response(message: str) -> str:
-    """Generate a simple AI response without using CrewAI agents."""
+async def simple_ai_response(message: str, user_id: str = None) -> str:
+    """
+    Enhanced AI response for Agent OFF mode - handles all queries with optional web search
+    
+    This function is used EXCLUSIVELY when agent_mode == False to ensure:
+    - No CrewAI agents are triggered
+    - Simple, direct responses to all queries
+    - Optional Tavily web search for current information queries
+    - Fallback responses for error cases
+    
+    Key Features:
+    - Auto-detects queries needing real-time info (news, weather, prices)
+    - Uses Tavily API for web search when needed
+    - Uses LangChain ChatGoogleGenerativeAI for responses
+    - Comprehensive fallback system for errors
+    
+    Args:
+        message: User's query/message
+        user_id: Optional user ID for future enhancements
+        
+    Returns:
+        str: AI-generated response (simple and direct)
+    """
     try:
-        llm = get_llm()
+        # Check if this query might need real-time information
+        search_keywords = ['latest', 'recent', 'current', 'today', 'news', 'weather', 'price', 'stock', 'rate', 'update', 'what happened', 'breaking']
+        needs_search = any(keyword in message.lower() for keyword in search_keywords)
+        
+        search_results = ""
+        if needs_search:
+            try:
+                # Use Tavily search for real-time information
+                from langchain_tools import TavilySearchTool
+                tavily_tool = TavilySearchTool()
+                search_results = await tavily_tool._arun(message, max_results=2)
+                print(f"Tavily search results: {search_results[:200]}...")
+            except Exception as search_error:
+                print(f"Tavily search failed: {search_error}")
+                search_results = ""
+        
+        # Use LangChain's ChatGoogleGenerativeAI for proper invoke method
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import HumanMessage
+        
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            temperature=0.3,
+            max_tokens=1024
+        )
+        
+        # Create enhanced prompt with search context if available
+        if search_results and search_results.strip() and not search_results.startswith("Error"):
+            prompt = f"""You are a helpful AI assistant. Answer the user's question using the provided search results when relevant.
 
-        # Create a simple prompt for casual conversation
-        prompt = f"""You are a helpful and friendly chatbot. 
-Respond to this message in a natural, conversational way. 
-Keep your response brief and friendly (1-2 sentences max).
+User Question: {message}
 
-User message: {message}
+Search Results:
+{search_results}
+
+Instructions:
+- Provide a clear, helpful answer based on the search results when relevant
+- If search results don't match the question, answer based on your knowledge
+- Keep responses concise but informative (2-3 sentences max)
+- Be friendly and conversational
+- Don't mention that you used search results unless specifically asked
 
 Response:"""
+        else:
+            prompt = f"""You are a helpful AI assistant. Respond to the user's question in a helpful, friendly way.
 
-        response = llm.invoke(prompt)
-        return str(response)
+User Question: {message}
+
+Instructions:
+- Provide a clear, helpful answer based on your knowledge
+- Keep responses concise but informative (2-3 sentences max)
+- Be friendly and conversational
+- If you don't know something current/recent, acknowledge that limitation
+
+Response:"""
+        
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return response.content
+        
     except Exception as e:
-        # Fallback responses for common greetings
-        message = message.lower().strip()
-        if any(greeting in message for greeting in ["hi", "hello", "hey"]):
+        print(f"Error in simple_ai_response: {e}")
+        # Enhanced fallback responses
+        message_lower = message.lower().strip()
+        if any(greeting in message_lower for greeting in ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']):
             return "Hello! How can I help you today?"
-        elif any(phrase in message for phrase in ["how are you", "how r u"]):
-            return "I'm doing great, thanks for asking! How can I assist you?"
-        elif any(phrase in message for phrase in ["thanks", "thank you"]):
+        elif any(question in message_lower for question in ['how are you', 'how do you do', 'how r u']):
+            return "I'm doing well, thank you! How can I assist you?"
+        elif any(phrase in message_lower for phrase in ['thanks', 'thank you']):
             return "You're welcome! Let me know if you need anything else."
+        elif 'weather' in message_lower:
+            return "I'd love to help with weather information, but I don't have access to current weather data right now. You might want to check a weather app or website for the most up-to-date information."
+        elif any(word in message_lower for word in ['news', 'latest', 'current']):
+            return "I don't have access to real-time information right now, but I'm happy to help with other questions or topics you'd like to discuss!"
         else:
             return "Hi there! I'm here to help. What would you like to know?"
 
@@ -942,74 +1014,97 @@ async def chat_endpoint(
 
         assistant_content = ""
 
-        # Agent mode logic: Only use specific agent if agent mode is ON and service is selected
-        if request.agent_mode and request.selected_apps:
-            # Handle specific integration agent based on selected apps
-            selected_integration = None
+        # =================================================================
+        # AGENT ON/OFF MODE - CLEAN SEPARATION IMPLEMENTATION
+        # =================================================================
+        # 
+        # Agent OFF Mode (agent_mode = False):
+        #   - Uses ONLY simple_ai_response() function
+        #   - No CrewAI agents triggered
+        #   - No auto-detection of app intents
+        #   - Optional Tavily search for current information
+        #   - Simple, direct responses
+        #
+        # Agent ON Mode (agent_mode = True):
+        #   - Uses full CrewAI agent system
+        #   - Auto-detection and app-specific agents
+        #   - Complex analysis and research capabilities
+        #   - Integration with selected apps
+        # =================================================================
 
-            # Map frontend app names to integration types
-            app_to_integration = {
-                "Gmail": "gmail",
-                "Google Calendar": "google_calendar",
-                "Google Docs": "google_docs",
-                "Notion": "notion",
-                "GitHub": "github",
-            }
+        # Agent mode logic: Clean separation between Agent ON and Agent OFF
+        if request.agent_mode:
+            # AGENT ON MODE: Use CrewAI agents and app integrations
+            if request.selected_apps:
+                # Handle specific integration agent based on selected apps
+                selected_integration = None
 
-            # Find the first selected integration that we support
-            for app in request.selected_apps:
-                if app in app_to_integration:
-                    selected_integration = app_to_integration[app]
-                    break
+                # Map frontend app names to integration types
+                app_to_integration = {
+                    "Gmail": "gmail",
+                    "Google Calendar": "google_calendar",
+                    "Google Docs": "google_docs",
+                    "Notion": "notion",
+                    "GitHub": "github",
+                }
 
-            if selected_integration:
-                # Use the selected integration's dedicated agent
-                assistant_content = await process_specific_app_query(
-                    message_text, user_id, selected_integration, conversation_history
-                )
-            else:
-                # No valid integration selected, use general agent
-                try:
-                    context = await get_context_for_query(user_id, message_text)
-                    full_prompt = f"{context}\n\nCurrent query: {message_text}"
-                    result = process_user_query(full_prompt)
-                    assistant_content = result
-                except Exception as e:
-                    logger.error(f"General agent error: {e}")
-                    assistant_content = (
-                        "I had trouble processing your request. Please try again later."
+                # Find the first selected integration that we support
+                for app in request.selected_apps:
+                    if app in app_to_integration:
+                        selected_integration = app_to_integration[app]
+                        break
+
+                if selected_integration:
+                    # Use the selected integration's dedicated agent
+                    assistant_content = await process_specific_app_query(
+                        message_text, user_id, selected_integration, conversation_history
                     )
-        else:
-            # Normal chatbot mode - auto-detect app intent with robust detection
-            detected_app = detect_specific_app_intent(
-                message_text, conversation_history
-            )
-            print(f"DEBUG: detected_app = {detected_app}")
-
-            if detected_app:
-                # Handle detected app query with dedicated agent
-                assistant_content = await process_specific_app_query(
-                    message_text, user_id, detected_app, conversation_history
-                )
-            else:
-                # Check if it's a simple message
-                is_simple = is_simple_message(message_text)
-                print(f"DEBUG: is_simple = {is_simple}")
-
-                if not is_simple:
-                    # Complex query - use CrewAI agents
+                else:
+                    # No valid integration selected, use general CrewAI agent
                     try:
-                        # Get relevant context from history
                         context = await get_context_for_query(user_id, message_text)
                         full_prompt = f"{context}\n\nCurrent query: {message_text}"
                         result = process_user_query(full_prompt)
                         assistant_content = result
                     except Exception as e:
-                        logger.error(f"CrewAI error: {e}")
-                        assistant_content = "I had trouble processing your complex request. Please try simplifying your question or try again later."
+                        logger.error(f"General agent error: {e}")
+                        assistant_content = (
+                            "I had trouble processing your request. Please try again later."
+                        )
+            else:
+                # Agent ON but no specific apps selected - auto-detect and use CrewAI
+                detected_app = detect_specific_app_intent(
+                    message_text, conversation_history
+                )
+                print(f"DEBUG: detected_app = {detected_app}")
+
+                if detected_app:
+                    # Handle detected app query with dedicated agent
+                    assistant_content = await process_specific_app_query(
+                        message_text, user_id, detected_app, conversation_history
+                    )
                 else:
-                    # Simple response
-                    assistant_content = await simple_ai_response(message_text)
+                    # Check if it's a simple message
+                    is_simple = is_simple_message(message_text)
+                    print(f"DEBUG: is_simple = {is_simple}")
+
+                    if not is_simple:
+                        # Complex query - use CrewAI agents
+                        try:
+                            context = await get_context_for_query(user_id, message_text)
+                            full_prompt = f"{context}\n\nCurrent query: {message_text}"
+                            result = process_user_query(full_prompt)
+                            assistant_content = result
+                        except Exception as e:
+                            logger.error(f"CrewAI error: {e}")
+                            assistant_content = "I had trouble processing your complex request. Please try simplifying your question or try again later."
+                    else:
+                        # Simple response even in Agent ON mode
+                        assistant_content = await simple_ai_response(message_text, user_id)
+        else:
+            # AGENT OFF MODE: Only use simple_ai_response (no CrewAI agents, no auto-detection)
+            print("DEBUG: Agent OFF mode - using simple_ai_response only")
+            assistant_content = await simple_ai_response(message_text, user_id)
 
         # Save assistant message
         await save_message(conversation_id, user_id, assistant_content, "assistant")
