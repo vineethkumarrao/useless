@@ -1166,6 +1166,50 @@ async def api_chat_endpoint(
         conversation_id=request.conversation_id
     )
 
+
+# Phase 2: Structured Response Endpoint
+@app.post("/api/chat/structured")
+async def structured_chat_endpoint(
+    request: ChatMessage,
+    user_id: str = Depends(get_current_user),
+    authorization: str = Header(None)
+):
+    """
+    Phase 2 endpoint returning structured Pydantic responses.
+    Returns full structured response with metadata, status, and typed data.
+    """
+    # Extract message from either format
+    if request.messages and len(request.messages) > 0:
+        message = request.messages[-1].get('content', '')  # Last user message
+    else:
+        message = request.message or ''
+    
+    if not message.strip():
+        raise HTTPException(400, detail="Message content is required")
+    
+    # Use internal chat processing
+    from crewai_agents import process_user_query, get_structured_response
+    response_text = process_user_query(
+        message, 
+        user_id, 
+        request.agent_mode, 
+        request.conversation_id,
+        request.messages if request.messages else []  # Pass full history
+    )
+    
+    # Get structured response (Phase 2 feature)
+    structured_data = get_structured_response(response_text, app_type="general")
+    
+    # Enhance with conversation metadata
+    structured_data.update({
+        "conversation_id": request.conversation_id,
+        "agent_mode": request.agent_mode,
+        "processing_type": 'complex' if request.agent_mode else 'simple'
+    })
+    
+    return structured_data
+
+
 # Gmail OAuth endpoints
 @app.get("/auth/gmail/debug/{user_id}")
 async def debug_gmail_oauth(user_id: str):

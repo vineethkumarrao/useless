@@ -1,6 +1,7 @@
 """
 CrewAI Agents for the Useless Chatbot AI Backend
 This module defines specialized agents for research, analysis, and writing tasks.
+Phase 2: Now includes structured Pydantic response formatting.
 """
 
 import os
@@ -12,38 +13,17 @@ import re
 from threading import local
 
 from crewai import Agent, Task, Crew, Process, LLM
-from langchain_tools import (
-    # Gmail tools
-    gmail_read_tool as read_gmail_emails,
-    gmail_send_tool as send_gmail_email,
-    gmail_search_tool as search_gmail_emails,
-    gmail_delete_tool as delete_gmail_emails,
-    # Calendar tools
-    google_calendar_list_tool as list_google_calendar_events,
-    google_calendar_create_tool as create_google_calendar_event,
-    google_calendar_update_tool as update_google_calendar_event,
-    google_calendar_delete_tool as delete_google_calendar_event,
-    # Docs tools
-    google_docs_list_tool as list_google_docs,
-    google_docs_read_tool as read_google_doc,
-    google_docs_create_tool as create_google_doc,
-    google_docs_update_tool as update_google_doc,
-    # Notion tools
-    notion_search_tool as search_notion,
-    notion_page_read_tool as read_notion_page,
-    notion_page_create_tool as create_notion_page,
-    notion_page_update_tool as update_notion_page,
-    notion_database_query_tool as query_notion_database,
-    # GitHub tools
-    github_repo_list_tool as list_github_repos,
-    github_repo_info_tool as get_github_repo_info,
-    github_issue_list_tool as list_github_issues,
-    github_issue_create_tool as create_github_issue,
-    github_file_read_tool as read_github_file,
-)
 
 from dotenv import load_dotenv
 from memory_manager import memory_manager
+
+# Phase 2: Import structured response system
+try:
+    from response_validator import create_structured_response, validator
+    STRUCTURED_RESPONSES_AVAILABLE = True
+except ImportError:
+    STRUCTURED_RESPONSES_AVAILABLE = False
+    print("Warning: Structured responses not available, using Phase 1 formatting")
 
 # Load environment variables
 load_dotenv()
@@ -63,7 +43,7 @@ def get_current_user_id() -> str:
 
 
 def get_llm():
-    """Get LLM instance using Google's Gemini via CrewAI."""
+    """Get optimized LLM instance for concise responses."""
     api_key = os.getenv('GOOGLE_API_KEY')
     if not api_key:
         raise ValueError("GOOGLE_API_KEY not found in environment")
@@ -71,8 +51,8 @@ def get_llm():
     return LLM(
         model="gemini/gemini-2.5-flash",
         api_key=api_key,
-        temperature=0.7,
-        max_tokens=1024
+        temperature=0.3,  # Lower for more consistent responses
+        max_tokens=150    # Force brevity - was 1024
     )
 
 
@@ -84,9 +64,9 @@ def get_agents():
     research_agent = Agent(
         role="Research Specialist",
         goal="Conduct thorough web research. Verify sources, provide URLs.",
-        backstory="""World-class researcher with real-time web access. Finds accurate info 
-        from credible sources, summarizes key findings. Always includes URLs, verifies 
-        quality, prioritizes recent content.""",
+        backstory="""World-class researcher with real-time web access. 
+        Finds accurate info from credible sources, summarizes key findings. 
+        Always includes URLs, verifies quality, prioritizes recent content.""",
         tools=[],  # Empty for now to avoid tool validation error
         llm=llm,
         verbose=False,
@@ -98,8 +78,9 @@ def get_agents():
     analysis_agent = Agent(
         role="Analysis Specialist",
         goal="Analyze findings, extract insights. Validate info, prepare summary.",
-        backstory="""Meticulous analyst expert in fact-checking. Identifies reliable sources, 
-        synthesizes info into actionable insights. Objective, evidence-based analysis.""",
+        backstory="""Meticulous analyst expert in fact-checking. 
+        Identifies reliable sources, synthesizes info into actionable insights. 
+        Objective, evidence-based analysis.""",
         llm=llm,
         verbose=False,
         allow_delegation=False
@@ -108,82 +89,216 @@ def get_agents():
     # Enhanced Writer Agent with strict conciseness enforcement
     writer_agent = Agent(
         role="Writing Specialist",
-        goal="Create extremely concise responses: 1-2 sentences maximum. Be direct and helpful.",
-        backstory="""Expert communicator who distills complex information into simple, 
-        actionable responses. Always prioritize brevity: maximum 2 sentences. Focus on 
-        what the user needs to know immediately. Friendly but professional tone.""",
+        goal="Create extremely concise responses: 1-2 sentences maximum.",
+        backstory="""Expert communicator who distills complex information 
+        into simple, actionable responses. Always prioritize brevity: 
+        maximum 2 sentences. Focus on what the user needs to know 
+        immediately. Friendly but professional tone.""",
         llm=llm,
         verbose=False,
         allow_delegation=False
     )
 
-    # Enhanced Gmail Agent
-    gmail_agent = Agent(
-        role="Gmail Assistant",
-        goal="Verify Gmail connection first. If connected, manage emails efficiently.",
-        backstory="""Intelligent email assistant. Check connection status before operations. 
-        Read, send, organize emails. Expert in etiquette, summarization, privacy.""",
-        tools=[read_gmail_emails, send_gmail_email, search_gmail_emails, 
-               delete_gmail_emails],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
+    return {
+        'research': research_agent,
+        'analysis': analysis_agent,
+        'writer': writer_agent
+    }
 
-    # Enhanced Google Calendar Agent
-    google_calendar_agent = Agent(
-        role="Google Calendar Assistant",
-        goal="Verify Calendar connection. If connected, manage events and schedules.",
-        backstory="""Expert scheduling assistant. Confirm connection first. Create events, 
-        check availability, optimize schedules. Understands time zones.""",
-        tools=[list_google_calendar_events, create_google_calendar_event,
-               update_google_calendar_event, delete_google_calendar_event],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
 
-    # Enhanced Google Docs Agent
-    google_docs_agent = Agent(
-        role="Google Docs Assistant",
-        goal="Verify Docs connection. If connected, create/edit documents.",
-        backstory="""Expert document assistant. Check connection before operations. 
-        Create structured docs, edit content, organize information. Understands formatting.""",
-        tools=[list_google_docs, read_google_doc, create_google_doc, 
-               update_google_doc],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
+def format_agent_response(response: str, app_type: str) -> str:
+    """
+    Format agent response using Phase 2 structured responses or Phase 1 fallback.
+    Returns JSON string of structured response if Phase 2 available, 
+    otherwise formatted string.
+    """
+    try:
+        # Phase 2: Use structured responses if available
+        if STRUCTURED_RESPONSES_AVAILABLE:
+            structured_response = create_structured_response(response, app_type)
+            # Return the message part for compatibility with existing code
+            return structured_response.message
+        
+        # Phase 1 fallback: Apply app-specific formatting based on templates
+        if app_type == 'gmail':
+            return format_gmail_response(response)
+        elif app_type == 'google_calendar':
+            return format_calendar_response(response)
+        elif app_type == 'google_docs':
+            return format_docs_response(response)
+        elif app_type == 'notion':
+            return format_notion_response(response)
+        elif app_type == 'github':
+            return format_github_response(response)
+        else:
+            return format_general_response(response)
+    except Exception:
+        # Ultimate fallback to truncated response
+        return truncate_response(response, 100)
 
-    # Enhanced Notion Agent
-    notion_agent = Agent(
-        role="Notion Assistant",
-        goal="Verify Notion connection. If connected, organize knowledge/workspace.",
-        backstory="""Knowledge management expert. Verify connection first. Create pages, 
-        organize databases, search content. Understands Notion features.""",
-        tools=[search_notion, read_notion_page, create_notion_page, 
-               update_notion_page, query_notion_database],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
-    )
 
-    # Enhanced GitHub Agent
-    github_agent = Agent(
-        role="GitHub Assistant",
-        goal="Verify GitHub connection. If connected, manage repos/issues.",
-        backstory="""Development assistant expert in version control. Check connection. 
-Browse repos, create issues/PRs, analyze code. Understands Git/GitHub.""",
-        tools=[list_github_repos, get_github_repo_info, list_github_issues, 
-               create_github_issue, read_github_file],
-        llm=llm,
-        verbose=False,
-        allow_delegation=False
+def get_structured_response(response: str, app_type: str) -> dict:
+    """
+    Get full structured response as dictionary.
+    This is the Phase 2 enhancement that returns complete structured data.
+    """
+    try:
+        if STRUCTURED_RESPONSES_AVAILABLE:
+            structured_response = create_structured_response(response, app_type)
+            return structured_response.model_dump()
+        else:
+            # Fallback structure for Phase 1 compatibility
+            return {
+                "status": "success",
+                "message": format_agent_response(response, app_type),
+                "response_type": "simple",
+                "app_type": app_type,
+                "timestamp": "2025-01-15T10:00:00Z"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Response formatting failed: {str(e)}",
+            "response_type": "error",
+            "app_type": app_type,
+            "timestamp": "2025-01-15T10:00:00Z"
+        }
+
+
+def format_gmail_response(response: str) -> str:
+    """Format Gmail response according to template."""
+    # Extract key info and format concisely
+    if "error" in response.lower() or "not connected" in response.lower():
+        return "Gmail not connected. Please connect in Settings > Integrations."
+    
+    # Look for numbers (email counts)
+    import re
+    numbers = re.findall(r'\d+', response)
+    
+    if "read" in response.lower() or "found" in response.lower():
+        count = numbers[0] if numbers else "0"
+        return f"Found {count} emails. Check your inbox for details."
+    elif "sent" in response.lower() or "send" in response.lower():
+        return "Email sent successfully."
+    elif "deleted" in response.lower():
+        count = numbers[0] if numbers else "0"
+        return f"Deleted {count} emails successfully."
+    else:
+        return truncate_response(response, 80)
+
+
+def format_calendar_response(response: str) -> str:
+    """Format Calendar response according to template."""
+    if "error" in response.lower() or "not connected" in response.lower():
+        return "Calendar not connected. Please connect in Settings > Integrations."
+    
+    if "created" in response.lower():
+        return "Event created successfully."
+    elif "updated" in response.lower():
+        return "Event updated successfully."
+    elif "deleted" in response.lower():
+        return "Event deleted successfully."
+    elif "events" in response.lower() or "schedule" in response.lower():
+        import re
+        numbers = re.findall(r'\d+', response)
+        count = numbers[0] if numbers else "0"
+        return f"Found {count} upcoming events."
+    else:
+        return truncate_response(response, 80)
+
+
+def format_docs_response(response: str) -> str:
+    """Format Docs response according to template."""
+    if "error" in response.lower() or "not connected" in response.lower():
+        return "Google Docs not connected. Please connect in Settings > Integrations."
+    
+    if "created" in response.lower():
+        return "Document created successfully."
+    elif "updated" in response.lower():
+        return "Document updated successfully."
+    elif "documents" in response.lower() or "found" in response.lower():
+        import re
+        numbers = re.findall(r'\d+', response)
+        count = numbers[0] if numbers else "0"
+        return f"Found {count} documents."
+    else:
+        return truncate_response(response, 80)
+
+
+def format_notion_response(response: str) -> str:
+    """Format Notion response according to template."""
+    if "error" in response.lower() or "not connected" in response.lower():
+        return "Notion not connected. Please connect in Settings > Integrations."
+    
+    if "created" in response.lower():
+        return "Page created successfully."
+    elif "updated" in response.lower():
+        return "Page updated successfully."
+    elif "found" in response.lower() or "pages" in response.lower():
+        import re
+        numbers = re.findall(r'\d+', response)
+        count = numbers[0] if numbers else "0"
+        return f"Found {count} pages."
+    else:
+        return truncate_response(response, 80)
+
+
+def format_github_response(response: str) -> str:
+    """Format GitHub response according to template."""
+    if "error" in response.lower() or "not connected" in response.lower():
+        return "GitHub not connected. Please connect in Settings > Integrations."
+    
+    if "created" in response.lower():
+        return "Issue/repo created successfully."
+    elif "repositories" in response.lower() or "repos" in response.lower():
+        import re
+        numbers = re.findall(r'\d+', response)
+        count = numbers[0] if numbers else "0"
+        return f"Found {count} repositories."
+    elif "issues" in response.lower():
+        import re
+        numbers = re.findall(r'\d+', response)
+        count = numbers[0] if numbers else "0"
+        return f"Found {count} issues."
+    else:
+        return truncate_response(response, 80)
+
+
+def format_general_response(response: str) -> str:
+    """Format general response to be concise."""
+    return truncate_response(response, 100)
+
+
+def create_crew_for_app(app_type: str, user_id: str, message: str):
+    """Create crew for specific app type using optimized agents."""
+    agents = get_optimized_agents()
+    app_agent = agents.get(app_type)
+    
+    if not app_agent:
+        return None
+    
+    # Set user context
+    set_user_context(user_id)
+    
+    # Create app-specific task with concise output requirement
+    task = Task(
+        description=f"""Handle this {app_type} request: {message}
+        
+        Requirements:
+        - Respond in 1-2 sentences maximum
+        - Be direct and actionable
+        - Include specific results (counts, names, etc.)
+        - Use proper status indicators""",
+        expected_output="Concise, structured response with clear action result",
+        agent=app_agent
     )
     
-    return (research_agent, analysis_agent, writer_agent, gmail_agent, 
-            google_calendar_agent, google_docs_agent, notion_agent, github_agent)
+    return Crew(
+        agents=[app_agent],
+        tasks=[task],
+        process=Process.sequential,
+        verbose=False
+    )
 
 
 def create_general_crew(user_id: str) -> Crew:
@@ -475,20 +590,26 @@ async def process_user_query_async(
                     result = await simple_ai_response(enriched_message, user_id)
             else:
                 result = await simple_ai_response(enriched_message, user_id)
-        else:
-            # For agent mode, detect app intent
+        # Apply response formatting for consistency and brevity
+        if agent_mode:
+            # For agent mode, apply app-specific formatting
             app_intent = detect_specific_app_intent(message, conversation_history)
             
             if app_intent == "gmail":
                 result = await handle_gmail_request(enriched_message, user_id, user_context)
+                result = format_agent_response(result, 'gmail')
             elif app_intent == "google_calendar":
                 result = await handle_calendar_request(enriched_message, user_id, user_context)
+                result = format_agent_response(result, 'google_calendar')
             elif app_intent == "google_docs":
                 result = await handle_docs_request(enriched_message, user_id, user_context)
+                result = format_agent_response(result, 'google_docs')
             elif app_intent == "notion":
                 result = await handle_notion_request(enriched_message, user_id, user_context)
+                result = format_agent_response(result, 'notion')
             elif app_intent == "github":
                 result = await handle_github_request(enriched_message, user_id, user_context)
+                result = format_agent_response(result, 'github')
             else:
                 # General query - include conversation context for better responses
                 if conversation_history:
@@ -498,7 +619,7 @@ async def process_user_query_async(
                             context_messages.append(f"User: {hist.get('content', '')}")
                         elif hist.get('role') == 'assistant':
                             context_messages.append(f"Assistant: {hist.get('content', '')}")
-                    
+                
                     if context_messages:
                         enhanced_message = f"Previous conversation:\n{chr(10).join(context_messages)}\n\nCurrent question: {enriched_message}"
                         result = await simple_ai_response(enhanced_message, user_id)
@@ -506,8 +627,29 @@ async def process_user_query_async(
                         result = await simple_ai_response(enriched_message, user_id)
                 else:
                     result = await simple_ai_response(enriched_message, user_id)
-        
-        # Store conversation exchange in memory
+                
+                # Apply general formatting for non-app specific queries
+                result = format_agent_response(result, 'general')
+        else:
+            # For simple AI mode, just apply general formatting
+            if conversation_history:
+                context_messages = []
+                for hist in conversation_history[-3:]:  # Last 3 messages
+                    if hist.get('role') == 'user':
+                        context_messages.append(f"User: {hist.get('content', '')}")
+                    elif hist.get('role') == 'assistant':
+                        context_messages.append(f"Assistant: {hist.get('content', '')}")
+                
+                if context_messages:
+                    enhanced_message = f"Previous conversation:\n{chr(10).join(context_messages)}\n\nCurrent question: {enriched_message}"
+                    result = await simple_ai_response(enhanced_message, user_id)
+                else:
+                    result = await simple_ai_response(enriched_message, user_id)
+            else:
+                result = await simple_ai_response(enriched_message, user_id)
+            
+            # Apply general formatting
+            result = format_agent_response(result, 'general')        # Store conversation exchange in memory
         if conversation_id:
             try:
                 # Store user message

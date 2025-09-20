@@ -339,7 +339,7 @@ async def test_memory_integration():
         # Should not remember previous conversation
         if result3['success']:
             assert "Alex" not in result3['response'], "Should not remember from different conversation"
-            assert "San Francisco" in result3['response'] == False, "Should not remember location from different conversation"
+            assert "San Francisco" not in result3['response'], "Should not remember location from different conversation"
             print("✅ Memory isolation test passed")
         
         # Test 3: Continue first conversation with context
