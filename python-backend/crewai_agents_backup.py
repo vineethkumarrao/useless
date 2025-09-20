@@ -467,35 +467,6 @@ async def simple_ai_response(message: str, user_id: str = None) -> str:
     """
     print(f"[DEBUG] simple_ai_response START: {message[:50]}...")
     
-    # Check if this is an app-specific request that would benefit from agent mode
-    app_keywords = {
-        'gmail': ['email', 'gmail', 'inbox', 'send email', 'reply', 'draft'],
-        'calendar': ['calendar', 'schedule', 'meeting', 'appointment', 'event'],
-        'github': ['repository', 'repo', 'github', 'commit', 'pull request', 'issue'],
-        'notion': ['notion', 'page', 'database', 'note'],
-        'docs': ['document', 'google docs', 'doc', 'gdoc']
-    }
-    
-    message_lower = message.lower()
-    detected_app = None
-    for app, keywords in app_keywords.items():
-        if any(keyword in message_lower for keyword in keywords):
-            detected_app = app
-            break
-    
-    if detected_app:
-        # This is an app-specific request - suggest agent mode
-        app_name_mapping = {
-            'gmail': 'Gmail',
-            'calendar': 'Google Calendar', 
-            'github': 'GitHub',
-            'notion': 'Notion',
-            'docs': 'Google Docs'
-        }
-        app_display_name = app_name_mapping.get(detected_app, detected_app)
-        
-        return f"I'd be happy to help with {app_display_name}! However, I'm currently in simple chat mode. For accessing your {app_display_name} data (emails, events, files, etc.), please switch to **Agent Mode ON** to enable full integration capabilities. \n\nIn Agent Mode, I can directly access and manage your connected apps to provide real-time information and perform actions."
-    
     # Always try fallback first if LLM issues suspected
     fallback_response = await _fallback_simple_response(message)
     
@@ -923,48 +894,30 @@ async def handle_calendar_request(message: str, user_id: str, user_context: str 
             elif any(word in message_lower for word in 
                      ['schedule', 'meeting', 'appointment', 'optimize']):
                 tool = CalendarSmartSchedulerTool()
-                # Extract basic event details from message
-                from datetime import datetime, timedelta
-                event_details = {
-                    'title': 'Meeting',
-                    'start_time': (datetime.now() + timedelta(days=1)).isoformat(),
-                    'end_time': (datetime.now() + timedelta(days=1, hours=1)).isoformat(),
-                    'description': message
-                }
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    event_details=event_details,
-                    auto_resolve_conflicts=True
+                    context=user_context
                 )
                 return f"�️ Smart Scheduling:\n{result}"
                 
             elif any(word in message_lower for word in 
                      ['availability', 'free', 'busy', 'conflicts']):
-                tool = CalendarAvailabilityFinderTool()
+                tool = CalendarAvailabilityManagerTool()
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    duration_minutes=60,
-                    preferred_dates=None,
-                    preferred_times="09:00-17:00"
+                    context=user_context
                 )
                 return f"⏰ Availability Analysis:\n{result}"
                 
             else:
-                # Use recurring event tool for other calendar operations
-                tool = CalendarRecurringEventTool()
-                # Extract basic event details from message
-                from datetime import datetime, timedelta
-                event_details = {
-                    'title': 'Event',
-                    'start_time': (datetime.now() + timedelta(days=1)).isoformat(),
-                    'end_time': (datetime.now() + timedelta(days=1, hours=1)).isoformat(),
-                    'description': message,
-                    'recurrence_pattern': 'weekly'
-                }
+                # Use enhanced event manager for complex queries
+                tool = CalendarEventManagerTool()
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    action='create',
-                    event_details=event_details
+                    context=user_context
                 )
                 return f"📅 Enhanced Calendar Management:\n{result}"
         
@@ -1145,43 +1098,41 @@ async def handle_github_request(message: str, user_id: str, user_context: str = 
             # Use enhanced tools for complex operations
             if any(word in message_lower for word in 
                    ['analyze', 'code', 'review', 'quality']):
-                tool = CodeAnalyzerTool()
+                tool = GitHubCodeAnalyzerTool()
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    action="analyze_repository",
-                    repo_owner="vineethkumarrao",
-                    repo_name="scanresume"
+                    context=user_context
                 )
                 return f"🔍 Code Analysis:\n{result}"
                 
             elif any(word in message_lower for word in 
                      ['workflow', 'ci', 'actions', 'automation']):
-                tool = WorkflowManagerTool()
+                tool = GitHubWorkflowManagerTool()
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    action="list_workflows",
-                    repo_owner="vineethkumarrao",
-                    repo_name="scanresume"
+                    context=user_context
                 )
                 return f"� Workflow Management:\n{result}"
                 
             elif any(word in message_lower for word in 
                      ['issue', 'bug', 'feature', 'manage']):
-                tool = IssueManagerTool()
+                tool = GitHubIssueManagerTool()
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    action="list_issues",
-                    repo_owner="vineethkumarrao",
-                    repo_name="scanresume"
+                    context=user_context
                 )
                 return f"🐛 Issue Management:\n{result}"
                 
             else:
                 # Use enhanced repository manager
-                tool = RepositoryManagerTool()
+                tool = GitHubRepositoryManagerTool()
                 result = await tool._arun(
+                    query=message,
                     user_id=user_id,
-                    action="list_repos"
+                    context=user_context
                 )
                 return f"📂 Enhanced Repository Management:\n{result}"
         
@@ -1195,45 +1146,12 @@ async def handle_github_request(message: str, user_id: str, user_context: str = 
                 f"� Your GitHub repositories:\n{result}", 500)
         
         elif any(word in message_lower for word in ['issues', 'open']):
-            # For basic tool, we need a repository name - try to use first available repo
-            try:
-                repos_result = await github_repo_list_tool._arun(user_id=user_id)
-                # Try to extract first repository name from the result
-                if "vineethkumarrao/" in repos_result:
-                    import re
-                    repo_match = re.search(r'vineethkumarrao/([a-zA-Z0-9_-]+)', repos_result)
-                    if repo_match:
-                        repo_name = f"vineethkumarrao/{repo_match.group(1)}"
-                        result = await github_issue_list_tool._arun(user_id=user_id, repo_name=repo_name)
-                        return f"🐛 Issues from {repo_name}:\n{result}"
-                return f"🐛 Your GitHub issues:\nPlease specify a repository name to view issues."
-            except Exception as e:
-                return f"❌ GitHub error: {str(e)}"
-            
-        elif any(word in message_lower for word in ['commit', 'commits', 'recent']):
-            # Use enhanced repository manager for commit history
-            if ENHANCED_TOOLS_AVAILABLE:
-                tool = RepositoryManagerTool()
-                result = await tool._arun(
-                    user_id=user_id,
-                    action="get_repo",
-                    repo_query={
-                        "owner": "vineethkumarrao",
-                        "repo_name": "scanresume",
-                        "include_details": True
-                    }
-                )
-                return f"📝 Recent commits:\n{result}"
-            else:
-                result = await github_repo_list_tool._arun(user_id=user_id)
-                return f"📂 Repository info (commits require enhanced tools):\n{result}"
-        
-        elif any(word in message_lower for word in ['files', 'browse', 'content']):
-            return f"📁 File browsing:\nFor file operations, please specify the repository and file path. Example: 'Show me README.md from scanresume repository'"
+            result = await github_issue_list_tool._arun(user_id=user_id)
+            return f"🐛 Your GitHub issues:\n{result}"
             
         else:
             result = await github_repo_list_tool._arun(user_id=user_id)
-            return f"📂 Your GitHub repositories:\n{result}"
+            return f"📂 Your recent GitHub activity:\n{result}"
             
     except Exception as e:
         return f"❌ GitHub error: {str(e)}"
